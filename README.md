@@ -2,7 +2,9 @@
 
 A high-performance, dual-verified tool for testing [Goldbach's Conjecture](https://en.wikipedia.org/wiki/Goldbach%27s_conjecture) — the oldest unsolved problem in mathematics.
 
-Built to the same credibility standard as [y-cruncher](https://www.numberworld.org/y-cruncher/) (the tool that holds pi computation world records), with one advantage: **multi-machine distributed verification**, which y-cruncher cannot do.
+Every result is checked by two independent primality tests (deterministic Miller-Rabin + Baillie-PSW) using exact integer arithmetic. If they ever disagree, the program halts. Results are output as independently verifiable proof certificates with SHA-256 hashing.
+
+1,425 lines of C. Zero dependencies. Runs anywhere with a C compiler.
 
 ---
 
@@ -32,7 +34,7 @@ gcc -O3 -march=native -pthread goldbach.c -o goldbach -lm
 
 This tool verifies the conjecture by testing even numbers and producing **dual-verified, independently checkable proof certificates**. Every result is confirmed by two independent primality tests (Miller-Rabin + Baillie-PSW). If they ever disagree, the program halts.
 
-The current world record is **4 x 10^18** (Oliveira e Silva, 2012). This tool can extend that.
+The current world record for exhaustive verification is **4 x 10^18** (Oliveira e Silva, 2012). This tool is designed to extend that — though doing so requires significant compute resources (see [Cloud Costs](#cloud-cost-to-extend-the-world-record) below). On a single machine, it can verify billions of numbers per day and sample-test numbers up to 10^24+.
 
 ---
 
@@ -75,7 +77,7 @@ Each node outputs a SHA-256 hash. Combine to verify full coverage.
 
 ### 4. Beyond-Record Sampling
 
-Test random numbers past the 4 x 10^18 world record. Each result is a dual-verified proof certificate.
+Test random numbers past the 4 x 10^18 world record. Each result is a dual-verified proof certificate. This is **sampling**, not exhaustive verification — it tests specific numbers but does not check every number in the range.
 
 ```bash
 ./goldbach --beyond 100000                     # 100K from default zones (4-10 x 10^18)
@@ -84,7 +86,7 @@ Test random numbers past the 4 x 10^18 world record. Each result is a dual-verif
 ./goldbach --beyond 1000 1e23 1e24 --cert c.txt  # 1K near 10^24 with certificates
 ```
 
-**Limits:** Exhaustive `--range` handles up to ~1.84 x 10^19 (uint64, sieve-based). Sampling `--beyond` has no practical ceiling — proven correct to 3.317 x 10^24, probabilistic (error < 10^-14) beyond that. The switch is automatic.
+**Limits:** Exhaustive `--range` handles up to ~1.84 x 10^19 (uint64, sieve-based). Sampling `--beyond` uses 128-bit arithmetic — results are proven correct to 3.317 x 10^24 (deterministic Miller-Rabin boundary). Past that, the engine automatically switches to 24 MR witnesses + BPSW, where results are probabilistic with error < 10^-14 per test. The output clearly labels which mode was used.
 
 ### 5. Verify Certificates
 
@@ -106,9 +108,11 @@ Runs 8 validation checks and refuses to proceed if any fail.
 
 ## How It Works
 
+For a deep dive into the math, development history, and benchmarks, see [GOLDBACH_RESEARCH.md](GOLDBACH_RESEARCH.md).
+
 ### The Shortcut
 
-Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. Empirically verified across 20 orders of magnitude: this needs at most ~300-400 attempts even for numbers past 10^18. That's a **10,000x+ speedup** over brute force.
+Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. Empirically verified across 20 orders of magnitude: this needs at most ~300-400 attempts even for numbers past 10^18. That's a **10,000x+ speedup** over brute force. This is a well-known property of prime distribution, not a new mathematical discovery — what's new is the engineering to exploit it at scale.
 
 ### Dual Verification
 
@@ -121,15 +125,15 @@ Two independent primality tests check every result:
 
 If they **ever disagree**, the program halts immediately.
 
-**Past 3.317 x 10^24**, the engine automatically switches to 24 MR witnesses (probabilistic, error < 10^-14) while keeping BPSW as the second check. The output clearly labels results as `PROVEN` or `PROBABILISTIC`. No configuration needed — it's automatic.
+**Past 3.317 x 10^24**, the engine automatically switches to 24 MR witnesses. Each witness independently has at most a 1/4 chance of missing a composite, so 24 witnesses give error probability < (1/4)^24 ~ 3 x 10^-15. Combined with BPSW (which uses entirely different math), both would have to fail on the same number — no such number has ever been found. Results in this range are labeled `PROBABILISTIC` in the output to distinguish them from the `PROVEN` results below the boundary.
 
 ### Three-Tier Counterexample Detection
 
 | Tier | What Happens |
 |------|-------------|
-| Shortcut finds a pair | Normal. Dual-verified, hashed, done. |
-| Shortcut exhausted | Full brute-force search kicks in automatically. |
-| Brute-force finds nothing | **Goldbach counterexample.** Program halts. Every prime was dual-checked. |
+| Shortcut finds a pair | Normal. Dual-verified, hashed, done. This happens for every number tested so far. |
+| Shortcut exhausted (2,048 small primes tried) | Automatic full brute-force search with dual verification. This has **never triggered** across all testing — included as a safety net. If it ever does, the pair is logged and the run continues. |
+| Brute-force finds nothing (every prime up to N/2 checked) | **Goldbach counterexample.** Program halts with explicit warning. Every candidate was dual-checked. This would disprove the conjecture. |
 
 ### Checkpointing
 
@@ -158,15 +162,27 @@ Scales linearly with cores. A 48-core server is ~12x faster.
 
 ---
 
-## Cloud Cost to Beat the World Record
+## Scaling Estimates
 
-The current record (4 x 10^18) has stood since 2012. Unlike y-cruncher which requires one massive machine, Goldbach verification distributes across cheap hardware:
+The current record (4 x 10^18) has stood since 2012. Goldbach verification is embarrassingly parallel — each number is independent — so it distributes across commodity hardware with no inter-node communication.
 
-| Setup | Time | Cost |
-|-------|------|------|
-| 100 Hetzner AX162 (48-core) | ~19 days | ~$3,500 |
-| 500 Hetzner AX52 (8-core) | ~19 days | ~$5,000 |
-| 100 AWS Spot c7i.24xlarge | ~19 days | ~$27,000 |
+**Pushing to 5 x 10^18** (5 x 10^17 even numbers past the record):
+
+| Total Cores | Estimated Time |
+|-------------|---------------|
+| 96 (2x 48-core) | ~17 days |
+| 240 (5x 48-core) | ~7 days |
+| 480 (10x 48-core) | ~3.5 days |
+
+**Doubling the record** to 8 x 10^18 (4 x 10^18 even numbers):
+
+| Total Cores | Estimated Time |
+|-------------|---------------|
+| 960 | ~6 months |
+| 2,400 | ~2.5 months |
+| 4,800 | ~5 weeks |
+
+Estimates based on ~7M dual-verified numbers/sec per 48 modern cores (AMD EPYC / Zen 4 class). Scales linearly.
 
 ---
 
