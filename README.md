@@ -4,7 +4,9 @@ A high-performance, dual-verified tool for testing [Goldbach's Conjecture](https
 
 Every result is checked by two independent primality tests (deterministic Miller-Rabin + Baillie-PSW) using exact integer arithmetic. If they ever disagree, the program halts. Results are output as independently verifiable proof certificates with SHA-256 hashing.
 
-1,425 lines of C. Zero dependencies. Runs anywhere with a C compiler.
+Single C file. Zero dependencies. Runs anywhere with a C compiler.
+
+**Current status:** Tool complete. Verified exhaustively to 10^10, sampled to 10^24. No records have been set — the current world record (4 × 10^18, Oliveira e Silva 2012) stands. Scaling estimates in this document are projections.
 
 ---
 
@@ -34,7 +36,7 @@ gcc -O3 -march=native -pthread goldbach.c -o goldbach -lm
 
 This tool verifies the conjecture by testing even numbers and producing **dual-verified, independently checkable proof certificates**. Every result is confirmed by two independent primality tests (Miller-Rabin + Baillie-PSW). If they ever disagree, the program halts.
 
-The current world record for exhaustive verification is **4 x 10^18** (Oliveira e Silva, 2012). This tool is designed to extend that — though doing so requires significant compute resources (see [Cloud Costs](#cloud-cost-to-extend-the-world-record) below). On a single machine, it can verify billions of numbers per day and sample-test numbers up to 10^24+.
+The current world record for exhaustive verification is **4 x 10^18** (Oliveira e Silva, 2012). This tool is designed to extend that — though doing so requires significant distributed compute (see [Scaling Estimates](#scaling-estimates) below). On a single machine, it can verify billions of numbers per day and sample-test numbers up to 10^24+.
 
 ---
 
@@ -123,7 +125,9 @@ For a deep dive into the math, development history, and benchmarks, see [GOLDBAC
 
 ### The Shortcut
 
-Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. Empirically verified across 20 orders of magnitude: this needs at most ~300-400 attempts even for numbers past 10^18. That's a **10,000x+ speedup** over brute force. This is a well-known property of prime distribution, not a new mathematical discovery — what's new is the engineering to exploit it at scale.
+Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. This is a well-known consequence of the prime number theorem — each N-p has roughly a 1/ln(N) chance of being prime, so O(log N) attempts usually suffice. The technique is not new (Oliveira e Silva's record-setting work used the same approach); what's new here is the engineering: dual-verified primality, certificate output, cluster distribution, and checkpoint/resume.
+
+We measured the scaling empirically across 20 orders of magnitude: at most ~300-400 primality tests per number even past 10^18. Each test costs O(log² N) to O(log³ N), making the total per-number cost O(log³ N) — dramatically better than brute force's O(N / ln N), but not as cheap as "O(log N)" without qualification.
 
 ### Dual Verification
 

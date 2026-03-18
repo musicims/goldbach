@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-An attempt to find computational shortcuts for Goldbach verification, analogous to how algorithms like Chudnovsky and BBP revolutionized pi computation. Rather than brute-forcing each even number individually, we sought structural properties that make verification fundamentally faster — and built a world-class verification engine with the same credibility standard as y-cruncher.
+A well-engineered implementation of known techniques for Goldbach verification — segmented sieve, small-prime shortcut (a well-known consequence of prime density), dual-verified primality testing, and certificate generation. The goal is a production-quality tool that could be used to extend the current exhaustive verification record.
 
-**Status:** Active research
+**Status:** Tool complete. No records set yet — verified exhaustively to 10^10, sampled to 10^24. Scaling estimates are projections.
 **Repository:** https://github.com/musicims/goldbach
 **Started:** 2026-03-17
 
@@ -22,11 +22,11 @@ An attempt to find computational shortcuts for Goldbach verification, analogous 
 
 ---
 
-## Key Discovery: The Small-Prime Shortcut
+## The Small-Prime Shortcut
 
-### Hypothesis
+### Background
 
-For every even N > 2, a Goldbach pair can be found by checking only the first few small primes. Instead of searching through all primes up to N/2, you try p = 2, 3, 5, 7, 11, ... and check if N-p is prime. The number of attempts needed grows logarithmically with N.
+It is well known that for most even N, a Goldbach pair can be found by checking small primes first. This follows from the prime number theorem — if each N-p has roughly a 1/ln(N) chance of being prime, then trying O(log N) small primes is usually sufficient. Oliveira e Silva's record-setting work used essentially the same approach. What we did is measure the scaling empirically, confirm it holds across 20 orders of magnitude, and build an optimized implementation around it.
 
 ### Verification Results
 
@@ -50,9 +50,9 @@ Tested exhaustively (every even number) up to 10^10 and by sampling (10,000+ ran
 - **Average attempts barely move** — even at 10^23, the average is ~29 attempts.
 - **Speedup over brute force:** ~14,832x at 10^8 scale. Grows with N.
 
-### Why This Matters
+### Complexity Note
 
-The existing record (4 × 10^18) was achieved by essentially checking each number. The small-prime shortcut means you only need O(log N) work per number instead of O(N / ln N). This is the kind of structural shortcut analogous to FFT-based algorithms for pi — it changes the complexity class of the operation.
+The shortcut reduces the number of primality tests per even N from O(N / ln N) in a brute-force search to O(log N). However, each primality test itself costs O(log² N) to O(log³ N) depending on the method (Miller-Rabin vs BPSW with Lucas sequences). So the actual per-number cost is O(log N × log² N) = O(log³ N), not O(log N). The comparison to brute force is still dramatically favorable, but the shortcut is not as cheap as "O(log N) per number" implies without qualification.
 
 ---
 
@@ -74,6 +74,8 @@ We built this to the same standard as **y-cruncher** (the program that holds pi 
 | Checkpoint/resume | YES | **YES** — `--checkpoint`, auto-save every 60s |
 | Live progress with ETA | YES | **YES** — auto-scales sec/min/hrs/days |
 | Multi-machine distribution | **NO** | **YES** — `--range` flag, embarrassingly parallel |
+
+**Important caveat:** This comparison covers engineering features, not the difficulty of the underlying problems. y-cruncher's dual computation verifies that two independent algorithms produced the same multi-trillion-digit number — a harder correctness problem. Our dual verification checks individual primality, which has well-understood error bounds. The problems are different in kind, not just scale.
 
 ### Dual Primality Tests
 
@@ -135,9 +137,9 @@ Method:         MR (24 witnesses) + BPSW — error < 10^-14
 
 **Limitation:** Memory-bound. NTT array must fit in RAM, limiting single-shot range to ~4M with the chosen prime.
 
-### Phase 2: Shortcut Discovery & Verification (`verify_shortcut.py`)
+### Phase 2: Shortcut Scaling Verification (`verify_shortcut.py`)
 
-**Goal:** Measure exactly how many small primes need to be tried before finding a Goldbach pair, for every even N.
+**Goal:** Empirically measure the scaling of the small-prime shortcut — how many primes need to be tried as N grows.
 
 **Method:** For each even N up to limit, iterate through primes p = 2, 3, 5, 7, ... and check if N-p is also prime. Record how many attempts were needed.
 
@@ -423,15 +425,23 @@ Numbers requiring the most attempts to find a pair (e.g., N=721,013,438 at 10^9 
 
 ### 3. Failure characterization — what would a counterexample require?
 
-This is the most compelling open direction. If an even N were a Goldbach counterexample, then for **every** prime p < N/2, the value N-p would have to be composite. Consider what this means:
+If an even N were a Goldbach counterexample, then for **every** prime p < N/2, the value N-p would have to be composite. Consider what this means:
 
 - For N around 10^18, there are ~30 trillion primes below N/2
 - Every single one, when subtracted from N, must land on a composite
-- The small primes alone (2, 3, 5, 7, ...) provide hundreds of independent "shots" at hitting a prime
+- The small primes alone (2, 3, 5, 7, ...) provide hundreds of "shots" at hitting a prime
 - Each shot has roughly a 1/ln(N) chance of success (~1/40 at 10^18)
-- For all ~400 small primes to miss simultaneously: roughly (1 - 1/40)^400 ≈ 4 × 10^-5
+- If the events were independent, the probability of all ~400 missing would be (1 - 1/40)^400 ≈ 4 × 10^-5
 
-This isn't a proof — the events aren't truly independent — but it illustrates the core difficulty. A counterexample would require a kind of coordinated avoidance of primality across hundreds of independent arithmetic conditions. Sieve theory (particularly the large sieve inequality and Bombieri-Vinogradov theorem) may be able to quantify exactly how impossible this coordination is for sufficiently large N. If the coordination can be bounded below some threshold, and the verified range exceeds that threshold, the conjecture follows.
+**But the events are not independent, and this is exactly what makes Goldbach hard.** The primality of N-p₁ and N-p₂ are correlated through their shared arithmetic structure relative to N. Hardy and Littlewood's Conjecture B (1923) accounts for these correlations through a "singular series" correction factor that depends on the prime factorization of N. Their heuristic predicts the asymptotic count of Goldbach representations as:
+
+r(N) ~ 2C₂ × ∏(p|N, p>2) (p-1)/(p-2) × N/ln²(N)
+
+where C₂ is the twin prime constant (~0.66). This predicts r(N) grows without bound — but the conjecture itself, and the singular series formula, remain unproven.
+
+The correlation structure is precisely why a naive probability argument fails as a proof. Sieve theory (the large sieve inequality, Bombieri-Vinogradov theorem) can bound the correlations but has not yet been strong enough to close the gap. Chen's theorem (1973) — every large even N = prime + semiprime — represents the current frontier of what sieve methods can prove.
+
+The open question is whether computational verification, combined with explicit bounds on the singular series for N below some threshold, could create a hybrid proof: "for N below X, we've checked; for N above X, the analytic bounds guarantee enough representations." This would require both pushing the exhaustive range further and tightening the analytic bounds — neither of which this project addresses, but both of which this tool could support.
 
 ### 4. Extending the Miller-Rabin proof boundary
 
@@ -449,6 +459,20 @@ These are implementation improvements rather than research questions:
 
 ---
 
+## Known Limitations
+
+- **No records set.** Exhaustive verification has been run to 10^10 on the development machine. The scaling estimates for larger ranges and cluster deployments are projections based on benchmarked throughput. No verification past 4 × 10^18 (the existing record) has been performed.
+- **No third-party reproduction.** All results so far come from a single implementation on a single machine. Independent reproduction — someone else compiling the code, running it, and confirming SHA-256 hashes match — has not yet occurred. The hashes below are published to enable this:
+
+| Range | SHA-256 |
+|-------|---------|
+| 4 to 10^8 | `4bad46c7978b742350a859af698fb54f170b5a6c50ca7031cdfd18d661261709` |
+| 4 to 10^9 | `b65507ab8e8362b605742fb86e5fbfa5b27897bd55a76860856b806018172b5e` |
+
+If you run the engine on the same range and get the same hash, that constitutes independent verification. If you get a different hash, something is wrong — file an issue.
+
+---
+
 ## Citation
 
 If referencing this work:
@@ -460,7 +484,10 @@ Tested up to 10^10 exhaustively, sampled to 10^23
 https://github.com/musicims/goldbach
 ```
 
-Primality test correctness references:
+References:
 - Sorenson & Webster, "Strong Pseudoprimes to Twelve Prime Bases", Mathematics of Computation, 2015
 - Baillie & Wagstaff, "Lucas Pseudoprimes", Mathematics of Computation, 1980
 - Pomerance, Selfridge & Wagstaff, "The Pseudoprimes to 25·10^9", Mathematics of Computation, 1980
+- Hardy & Littlewood, "Some Problems of 'Partitio Numerorum' III", Acta Mathematica, 1923
+- Oliveira e Silva, Herzog & Pardi, "Empirical Verification of the Even Goldbach Conjecture up to 4·10^18", Mathematics of Computation, 2014
+- Chen, "On the Representation of a Large Even Integer as the Sum of a Prime and the Product of at Most Two Primes", Scientia Sinica, 1973
