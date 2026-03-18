@@ -1,0 +1,54 @@
+GOLDBACH VERIFICATION ENGINE v2.0
+=================================
+
+Verifies Goldbach's Conjecture using dual-verified exact integer arithmetic.
+Same credibility standard as y-cruncher (dual computation, SHA-256 hashing).
+
+QUICK START
+-----------
+
+  ./build.sh        Build (auto-detects compiler + CPU)
+  ./goldbach        Interactive menu
+  ./goldbach 1e9    Verify up to 1 billion
+
+Or one-liner on any Linux/macOS machine:
+
+  bash build.sh && ./goldbach
+
+REQUIREMENTS
+------------
+
+  - Any C compiler (gcc, clang, cc)
+  - pthreads (included on Linux/macOS)
+  - That's it. No libraries. No package managers.
+
+CLUSTER USE
+-----------
+
+Split ranges across machines:
+
+  Machine 1:  ./goldbach --range 4        1e15
+  Machine 2:  ./goldbach --range 1e15     2e15
+  Machine 3:  ./goldbach --range 2e15     3e15
+  ...
+
+Each machine outputs a SHA-256 hash. Combine to verify completeness.
+
+FILES
+-----
+
+  goldbach.c          The entire engine (1100 lines, zero dependencies)
+  build.sh            Build script (auto-detects compiler + CPU flags)
+  README              This file
+
+  Python prototypes (optional, for research/exploration):
+  goldbach_fft.py     NTT convolution approach
+  verify_shortcut.py  Shortcut scaling analysis
+  goldbach_engine.py  Python segmented sieve verifier
+  goldbach_beyond.py  Python beyond-record tester
+
+FULL DOCUMENTATION
+------------------
+
+  See GOLDBACH_RESEARCH.md for complete research notes, benchmarks,
+  bug history, and theoretical analysis.
