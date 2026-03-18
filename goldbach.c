@@ -652,29 +652,43 @@ static inline int sieve_is_prime_bit(const uint8_t *sieve, uint64_t index) {
 }
 
 static void generate_base_primes(uint64_t limit) {
-    uint64_t size = limit + 1;
-    uint8_t *is_prime = (uint8_t *)calloc(size, 1);
-    if (!is_prime) { fprintf(stderr, "ERROR: alloc failed\n"); exit(1); }
+    /* Bit-packed sieve: 1 bit per odd number. Memory = limit/16 bytes.
+     * For limit = 4.3×10^9 (sqrt of 1.84×10^19): ~270MB instead of ~4.3GB. */
+    uint64_t sieve_size = (limit / 2 + 7) / 8 + 1;  /* bits for odds up to limit */
+    uint8_t *sieve = (uint8_t *)calloc(sieve_size, 1);
+    if (!sieve) {
+        fprintf(stderr, "ERROR: cannot allocate %" PRIu64 " bytes for base sieve\n", sieve_size);
+        exit(1);
+    }
 
-    if (size > 2) is_prime[2] = 1;
-    for (uint64_t i = 3; i < size; i += 2) is_prime[i] = 1;
-    for (uint64_t i = 3; i * i < size; i += 2)
-        if (is_prime[i])
-            for (uint64_t j = i*i; j < size; j += 2*i) is_prime[j] = 0;
+    /* In this sieve: bit i represents number 2*i+1. Bit set = composite. */
+    for (uint64_t i = 1; (2*i+1)*(2*i+1) <= limit; i++) {
+        if (!(sieve[i >> 3] & (1u << (i & 7)))) {
+            /* 2*i+1 is prime — cross off its odd multiples */
+            uint64_t p = 2*i+1;
+            for (uint64_t j = (p*p - 1)/2; j < limit/2 + 1; j += p)
+                sieve[j >> 3] |= (1u << (j & 7));
+        }
+    }
 
-    int count = 0;
-    for (uint64_t i = 2; i < size; i++) if (is_prime[i]) count++;
+    /* Count primes */
+    uint64_t count = 1;  /* start with 2 */
+    for (uint64_t i = 1; 2*i+1 <= limit; i++)
+        if (!(sieve[i >> 3] & (1u << (i & 7)))) count++;
 
     base_primes = (uint32_t *)malloc(count * sizeof(uint32_t));
+    if (!base_primes) { fprintf(stderr, "ERROR: alloc failed for base primes\n"); exit(1); }
     num_base_primes = 0;
-    for (uint64_t i = 2; i < size; i++)
-        if (is_prime[i]) base_primes[num_base_primes++] = (uint32_t)i;
+    base_primes[num_base_primes++] = 2;
+    for (uint64_t i = 1; 2*i+1 <= limit; i++)
+        if (!(sieve[i >> 3] & (1u << (i & 7))))
+            base_primes[num_base_primes++] = (uint32_t)(2*i+1);
 
     num_small_primes = 0;
     for (int i = 0; i < num_base_primes && num_small_primes < MAX_SMALL_PRIMES; i++)
         small_primes[num_small_primes++] = base_primes[i];
 
-    free(is_prime);
+    free(sieve);
 }
 
 /* ============================================================================
@@ -1251,16 +1265,23 @@ static int detect_cores(void) {
 
 static const char *checkpoint_file = NULL;
 
+/* Restored from checkpoint for hash continuity across resumes */
+static uint64_t prior_verified = 0;
+static uint64_t prior_max_attempts = 0;
+static uint64_t prior_max_attempts_n = 0;
+
 static void write_checkpoint(uint64_t range_start, uint64_t range_end,
                              ThreadWork *work, int num_threads, double elapsed) {
     if (!checkpoint_file) return;
 
     /* Find minimum current_n across all threads = safe resume point */
     uint64_t min_n = UINT64_MAX;
-    uint64_t total_verified = 0;
+    uint64_t total_verified = prior_verified;
+    uint64_t cp_max_att = prior_max_attempts;
     for (int i = 0; i < num_threads; i++) {
         if (work[i].current_n < min_n) min_n = work[i].current_n;
         total_verified += work[i].verified_count;
+        if (work[i].max_attempts > cp_max_att) cp_max_att = work[i].max_attempts;
     }
 
     /* Write to temp file, then rename (atomic on most filesystems) */
@@ -1275,6 +1296,7 @@ static void write_checkpoint(uint64_t range_start, uint64_t range_end,
     fprintf(f, "safe_resume=%" PRIu64 "\n", min_n);
     fprintf(f, "threads=%d\n", num_threads);
     fprintf(f, "verified=%" PRIu64 "\n", total_verified);
+    fprintf(f, "max_attempts=%" PRIu64 "\n", cp_max_att);
     fprintf(f, "elapsed=%.1f\n", elapsed);
 
     double rate = total_verified / (elapsed > 0 ? elapsed : 1);
@@ -1288,6 +1310,9 @@ static void write_checkpoint(uint64_t range_start, uint64_t range_end,
 }
 
 static uint64_t read_checkpoint(uint64_t range_start, uint64_t range_end) {
+    prior_verified = 0;
+    prior_max_attempts = 0;
+    prior_max_attempts_n = 0;
     if (!checkpoint_file) return range_start;
 
     FILE *f = fopen(checkpoint_file, "r");
@@ -1295,17 +1320,23 @@ static uint64_t read_checkpoint(uint64_t range_start, uint64_t range_end) {
 
     char line[256];
     uint64_t saved_start = 0, saved_end = 0, resume = 0;
+    uint64_t saved_verified = 0, saved_max_att = 0;
 
     while (fgets(line, sizeof(line), f)) {
         sscanf(line, "range=%" SCNu64 "-%" SCNu64, &saved_start, &saved_end);
         sscanf(line, "safe_resume=%" SCNu64, &resume);
+        sscanf(line, "verified=%" SCNu64, &saved_verified);
+        sscanf(line, "max_attempts=%" SCNu64, &saved_max_att);
     }
     fclose(f);
 
     /* Only use checkpoint if it matches our range */
     if (saved_start == range_start && saved_end == range_end && resume > range_start) {
         printf("  Resuming from checkpoint: %" PRIu64 "\n", resume);
+        printf("  Prior verified: %" PRIu64 "\n", saved_verified);
         printf("  (delete %s to start fresh)\n\n", checkpoint_file);
+        prior_verified = saved_verified;
+        prior_max_attempts = saved_max_att;
         return resume;
     }
 
@@ -1376,11 +1407,12 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
             }
 
             double rate = total_v / (elapsed > 0 ? elapsed : 1);
-            uint64_t remaining = (range_end > min_n) ? (range_end - min_n) / 2 : 0;
+            uint64_t total_even = (range_end - effective_start) / 2;
+            uint64_t remaining = (total_even > total_v) ? total_even - total_v : 0;
             double eta = remaining / (rate > 0 ? rate : 1);
 
-            /* Progress line */
-            double pct = 100.0 * (min_n - effective_start) / (double)(range_end - effective_start);
+            /* Progress based on total work done, not slowest thread position */
+            double pct = 100.0 * total_v / (double)(total_even > 0 ? total_even : 1);
             fprintf(stderr, "\r  [%5.1f%%] %" PRIu64 " verified | %.0f/s | ETA: ",
                     pct, total_v, rate);
             if (eta < 120) fprintf(stderr, "%.0fs    ", eta);
@@ -1408,8 +1440,8 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
                         (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
 
     /* Aggregate */
-    uint64_t total_verified = 0, total_dual = 0;
-    uint64_t g_max_att = 0, g_max_att_n = 0;
+    uint64_t total_verified = prior_verified, total_dual = 0;
+    uint64_t g_max_att = prior_max_attempts, g_max_att_n = prior_max_attempts_n;
     uint64_t counterexample = 0;
 
     for (int i = 0; i < num_threads; i++) {
