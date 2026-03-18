@@ -577,7 +577,52 @@ static void *verify_range_thread(void *arg) {
                 }
             }
 
-            if (!found) work->counterexample = n;
+            if (!found) {
+                /* Shortcut exhausted — do FULL brute-force search with dual
+                 * verification before declaring a counterexample.
+                 * This is the difference between "hard number" and
+                 * "disproof of Goldbach's Conjecture." */
+                fprintf(stderr,
+                    "\n*** SHORTCUT EXHAUSTED at N=%" PRIu64 " ***\n"
+                    "Running full brute-force search (dual-verified)...\n", n);
+
+                for (uint64_t p2 = small_primes[num_small_primes - 1] + 2;
+                     p2 <= n / 2; p2 += 2) {
+                    /* Only check odd candidates (2 was already tried) */
+                    uint64_t q2 = n - p2;
+                    if (is_prime_miller_rabin(p2) && is_prime_bpsw(p2) &&
+                        is_prime_miller_rabin(q2) && is_prime_bpsw(q2)) {
+                        fprintf(stderr,
+                            "  FOUND PAIR: %" PRIu64 " = %" PRIu64 " + %" PRIu64 "\n"
+                            "  (Required extended search — shortcut insufficient)\n",
+                            n, p2, q2);
+
+                        char cert[128];
+                        int len = snprintf(cert, sizeof(cert),
+                            "%" PRIu64 "=%" PRIu64 "+%" PRIu64 "\n", n, p2, q2);
+                        sha256_update(&work->hash_ctx, cert, len);
+                        work->dual_checks++;
+                        found = 1;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    /* No pair found after exhaustive search.
+                     * This would disprove Goldbach's Conjecture. */
+                    fprintf(stderr,
+                        "\n"
+                        "************************************************************\n"
+                        "*** GOLDBACH COUNTEREXAMPLE: %" PRIu64 " ***\n"
+                        "************************************************************\n"
+                        "No pair of primes sums to this even number.\n"
+                        "Full brute-force search completed (dual-verified).\n"
+                        "THIS WOULD DISPROVE GOLDBACH'S CONJECTURE.\n"
+                        "Verify independently before making any claims.\n"
+                        "************************************************************\n", n);
+                    work->counterexample = n;
+                }
+            }
             if (attempts > work->max_attempts) {
                 work->max_attempts = attempts;
                 work->max_attempts_n = n;
