@@ -237,7 +237,9 @@ Every result rests on exact, proven mathematics:
 6. **Self-test suite** — validates sieve, both primality tests, modular arithmetic, dual agreement across 100,000 numbers, and cross-checks shortcut against brute force — all before every run
 7. **Certificate format** — each result is `N=p+q` where both p and q are dual-verified primes. Anyone can check independently: Is p prime? Is q prime? Does p + q = N?
 
-**What is not yet proven analytically:** Why the shortcut works (that the first O(log N) primes always yield a pair). Proving this would be equivalent to proving Goldbach's conjecture.
+### The Gap
+
+**What is not yet proven analytically:** Why the shortcut works — specifically, that the first O(log N) primes always yield a Goldbach pair. Proving this rigorously would be equivalent to (or very close to) proving Goldbach's Conjecture itself. This is the central open question underlying all of this work. Everything above verifies that the conjecture holds for tested numbers; nothing above explains *why* it holds. That distinction — between verification and proof — is the line this project does not cross.
 
 ### Three-Tier Counterexample Detection
 
@@ -259,7 +261,7 @@ Tier 3 has never triggered. If it ever does, the result is airtight — every ca
 |------|-------|---------|
 | `goldbach.c` | 1,425 | **Production engine v2.0** — dual-verified, multi-threaded, self-testing, three-tier counterexample detection, checkpointing/resume, interactive menu, cluster support, certificate output/verification, SHA-256 hashing. Single file, zero dependencies. |
 | `build.sh` | ~80 | Build script — auto-detects compiler (gcc/clang/zig), CPU architecture, and optimal flags. |
-| `README` | ~40 | Quick start guide |
+| `README.md` | ~200 | Quick start guide, full CLI reference, scaling estimates |
 | `goldbach_fft.py` | 283 | NTT convolution engine — computes r(N) for all N simultaneously using exact integer transform |
 | `verify_shortcut.py` | 160 | Empirical verification of the small-prime shortcut at multiple scales |
 | `goldbach_engine.py` | 280 | Python verifier with segmented sieve + shortcut for large continuous ranges |
@@ -288,69 +290,10 @@ The C engine runs these before every execution and refuses to proceed if any fai
 
 ## How to Run
 
-### C Engine (recommended — production quality)
+See [README.md](README.md) for full usage instructions, all CLI flags, and examples. Quick start:
 
 ```bash
-# Build (auto-detects compiler + CPU)
-./build.sh
-
-# Or compile manually
-gcc -O3 -march=native -pthread goldbach.c -o goldbach -lm
-
-# Interactive menu (like y-cruncher)
-./goldbach
-
-# Self-test only
-./goldbach --selftest
-
-# Exhaustive verification (auto-detects core count)
-./goldbach 1e10               # 10 billion
-./goldbach 1e10 8             # 10 billion, 8 threads explicit
-
-# With checkpointing (auto-saves every 60s, resumes on restart)
-./goldbach 1e12 --checkpoint progress.txt
-
-# Cluster mode — split range across machines
-./goldbach --range 0 1e15 --checkpoint node1.txt      # Machine 1
-./goldbach --range 1e15 2e15 --checkpoint node2.txt    # Machine 2
-./goldbach --range 2e15 3e15 --checkpoint node3.txt    # Machine 3
-
-# Beyond-record sampling (default zones past 4×10^18)
-./goldbach --beyond 100000
-
-# Beyond-record with custom range and certificates
-./goldbach --beyond 1000000 4e18 5e18 --cert certs.txt
-
-# Sample near the uint64 limit (~1.84×10^19)
-./goldbach --beyond 50000 1e19 1.8e19
-
-# Independently verify a certificate file
-./goldbach --verify certificates.txt
-
-# Help
-./goldbach --help
-```
-
-**Note:** Exhaustive `--range` mode is limited to ~1.84 x 10^19 (uint64, sieve-based). The `--beyond` sampling mode uses 128-bit arithmetic and handles numbers up to **3.317 x 10^24** (the Miller-Rabin proof limit) — no Python needed.
-
-### Python Tools (zero dependencies, run anywhere)
-
-```bash
-# NTT convolution — compute Goldbach pair counts for all N up to 200K
-python3 goldbach_fft.py
-
-# Verify the shortcut scaling across 4 orders of magnitude
-python3 verify_shortcut.py
-
-# Exhaustive verification with segmented sieve (default 10M)
-python3 goldbach_engine.py 1e7
-python3 goldbach_engine.py 1e8
-
-# Test numbers past the world record
-python3 goldbach_beyond.py
-
-# Generate human-readable certificates
-python3 goldbach_certify.py
+./build.sh && ./goldbach
 ```
 
 ---
@@ -451,43 +394,45 @@ for i in $(seq 0 $((N_MACHINES - 1))); do
 done
 ```
 
-Each node outputs a SHA-256 hash. Combine all hashes to verify full coverage.
-
-**Estimated cloud costs to beat the world record (4×10^18):**
-
-| Provider | Machines | Time | Cost |
-|----------|----------|------|------|
-| Hetzner AX162 (48-core EPYC) | 100 | ~19 days | ~$3,500 |
-| AWS c7i.24xlarge Spot | 100 | ~19 days | ~$27,000 |
-| Hetzner AX52 (8-core Ryzen) | 500 | ~19 days | ~$5,000 |
-
-### Scaling Estimates (Single Machine)
-
-| Target | Even Numbers | Time (48-core, dual) | Time (48-core, single-method) |
-|--------|-------------|----------------------|-------------------------------|
-| 10^10 | 5B | ~1 minute | ~5 seconds |
-| 10^11 | 50B | ~10 minutes | ~30 seconds |
-| 10^12 | 500B | ~1.5 hours | ~3 minutes |
-| 10^13 | 5T | ~15 hours | ~30 minutes |
-| 10^14 | 50T | ~6 days | ~5 hours |
-
-Single-method (Miller-Rabin only) is still provably correct — deterministic for n < 3.317 × 10^24. Dual verification is belt-and-suspenders.
+Each node outputs a SHA-256 hash. Combine all hashes to verify full coverage. See [README.md](README.md#scaling-estimates) for multi-machine scaling estimates.
 
 ---
 
-## Open Questions & Future Work
+## Open Research Questions
 
-1. **Why does the shortcut work?** The small-prime coverage is likely related to the density of primes in arithmetic progressions (Dirichlet's theorem) and prime gap distribution. Formalizing this could approach a proof of Goldbach itself.
+### 1. Why does the shortcut work?
 
-2. **Push exhaustive verification further.** At 6.4M/sec dual-verified on 4 cores, a 32-core server could reach ~50M/sec. A 10^12 sweep would take ~5.5 hours. A cluster of 100 machines could push into 10^14 territory.
+The small-prime coverage — that the first O(log N) primes almost always contain a Goldbach pair — is empirically verified across 20 orders of magnitude but not proven. It likely follows from the density of primes in arithmetic progressions (Dirichlet's theorem, Siegel-Walfisz theorem) and the statistical distribution of prime gaps. Formalizing this connection could approach a proof of the conjecture itself.
 
-3. **Hardest numbers analysis.** Numbers requiring the most attempts (e.g., N=721,013,438 at 10^9 scale, 278 attempts) have structure worth investigating — they're surrounded by many composites of the form N-p for small primes p.
+### 2. Hardest numbers and their structure
 
-4. **Failure characterization.** If a counterexample existed, every small prime p < ~500 would need N-p composite. For large N with hundreds of candidate primes, this requires an impossibly coordinated "avoidance" of primality — potentially quantifiable via sieve theory.
+Numbers requiring the most attempts to find a pair (e.g., N=721,013,438 at 10^9 scale, 278 attempts) share structural properties worth investigating. For these "hard" N, the values N-2, N-3, N-5, N-7, ... (N minus each small prime) are all composite for an unusually long stretch. This means hard numbers sit in regions where subtracting any small prime lands you in a "composite desert." Understanding what creates these deserts — likely related to smooth numbers and the distribution of prime gaps — could reveal structure in the conjecture.
 
-5. **GPU acceleration.** The sieve and per-number checks are SIMD-friendly. A CUDA port could push throughput to billions/sec even with dual verification.
+### 3. Failure characterization — what would a counterexample require?
 
-6. **Single-method fast mode.** The v1.0 architecture (Miller-Rabin only, proven deterministic) runs at 312M/sec. For exploratory runs where dual verification isn't needed, this mode could be re-exposed as a `--fast` flag.
+This is the most compelling open direction. If an even N were a Goldbach counterexample, then for **every** prime p < N/2, the value N-p would have to be composite. Consider what this means:
+
+- For N around 10^18, there are ~30 trillion primes below N/2
+- Every single one, when subtracted from N, must land on a composite
+- The small primes alone (2, 3, 5, 7, ...) provide hundreds of independent "shots" at hitting a prime
+- Each shot has roughly a 1/ln(N) chance of success (~1/40 at 10^18)
+- For all ~400 small primes to miss simultaneously: roughly (1 - 1/40)^400 ≈ 4 × 10^-5
+
+This isn't a proof — the events aren't truly independent — but it illustrates the core difficulty. A counterexample would require a kind of coordinated avoidance of primality across hundreds of independent arithmetic conditions. Sieve theory (particularly the large sieve inequality and Bombieri-Vinogradov theorem) may be able to quantify exactly how impossible this coordination is for sufficiently large N. If the coordination can be bounded below some threshold, and the verified range exceeds that threshold, the conjecture follows.
+
+### 4. Extending the Miller-Rabin proof boundary
+
+The current deterministic boundary (3.317 × 10^24, Sorenson & Webster 2015) has been pushed up over the years by finding larger "strong pseudoprime-free" regions for specific witness sets. Extending this further — either by mathematical proof or by exhaustive computation of strong pseudoprimes — would expand the range where our results carry a proven-correct label rather than a probabilistic one.
+
+---
+
+## Engineering Directions
+
+These are implementation improvements rather than research questions:
+
+- **GPU acceleration.** The sieve and per-number checks are SIMD-friendly. A CUDA port could push throughput significantly, even with dual verification.
+- **Single-method fast mode.** Re-expose the v1.0 architecture (Miller-Rabin only, still proven deterministic) as a `--fast` flag for exploratory runs where dual verification isn't needed. This runs at ~312M/sec vs ~7M/sec.
+- **Multi-prime NTT.** Using Chinese Remainder Theorem across multiple NTT primes would allow exact convolution for arbitrarily large ranges in the research prototype.
 
 ---
 
