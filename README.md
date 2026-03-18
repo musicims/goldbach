@@ -156,7 +156,7 @@ The key: if the shortcut ever fails to find a pair (which has never happened), t
 
 For context: Oliveira e Silva's record (4 × 10^18) was set using sieve-only verification — no Miller-Rabin, no BPSW, no dual check. Fast mode uses the same fundamental approach (sieve-only for routine checks) with the addition of automatic dual escalation on any failure.
 
-**Reproducibility note:** In dual mode, the SHA-256 hash depends on thread count (each thread hashes its certificates independently, and the master hash combines them). Running the same range with different thread counts will produce different hashes. Match thread count when comparing hashes across runs.
+The SHA-256 hash is computed from the run summary (range, count, max attempts) and is thread-count-independent. The same range produces the same hash regardless of how many threads were used. Per-certificate integrity checking is available separately via `--cert` + `--verify`.
 
 ### Adversarial Testing (`--suspect`)
 

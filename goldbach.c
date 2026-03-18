@@ -727,7 +727,6 @@ typedef struct {
     uint64_t counterexample;
     uint64_t dual_checks;
     double elapsed;
-    SHA256 hash_ctx;
 } ThreadWork;
 
 static void *verify_range_thread(void *arg) {
@@ -746,7 +745,6 @@ static void *verify_range_thread(void *arg) {
     work->max_attempts_n = 0;
     work->counterexample = 0;
     work->dual_checks = 0;
-    sha256_init(&work->hash_ctx);
 
     uint64_t margin = small_primes[num_small_primes - 1] + 100;
     uint64_t check_range = 500000;
@@ -894,13 +892,6 @@ static void *verify_range_thread(void *arg) {
                             exit(2);
                         }
                         work->dual_checks++;
-
-                        /* Hash this certificate */
-                        char cert[128];
-                        int len = snprintf(cert, sizeof(cert),
-                            "%" PRIu64 "=%" PRIu64 "+%" PRIu64 "\n", n, p, q);
-                        sha256_update(&work->hash_ctx, cert, len);
-
                         found = 1;
                         break;
                     }
@@ -919,10 +910,6 @@ static void *verify_range_thread(void *arg) {
                             fprintf(stderr,
                                 "  FOUND PAIR: %" PRIu64 " = %" PRIu64 " + %" PRIu64 "\n"
                                 "  (Required extended search)\n", n, p2, q2);
-                            char cert[128];
-                            int len = snprintf(cert, sizeof(cert),
-                                "%" PRIu64 "=%" PRIu64 "+%" PRIu64 "\n", n, p2, q2);
-                            sha256_update(&work->hash_ctx, cert, len);
                             work->dual_checks++;
                             found = 1;
                             break;
@@ -1441,13 +1428,13 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
                work[i].max_attempts, work[i].elapsed);
     }
 
-    /* Compute result hash.
-     * Dual mode: hash of all per-thread certificate hashes (granular).
-     * Fast mode: hash of the summary (range, count, max attempts). */
+    /* Compute result hash from summary — thread-count-independent.
+     * Hash is deterministic for a given range + result, regardless of
+     * how many threads were used. Per-certificate integrity is handled
+     * separately via --cert + --verify. */
     SHA256 master_hash;
     sha256_init(&master_hash);
-
-    if (fast_mode) {
+    {
         char summary[256];
         int len = snprintf(summary, sizeof(summary),
             "range=%" PRIu64 "-%" PRIu64
@@ -1456,12 +1443,6 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
             " counterexample=%" PRIu64 "\n",
             range_start, range_end, total_verified, g_max_att, counterexample);
         sha256_update(&master_hash, summary, len);
-    } else {
-        for (int i = 0; i < num_threads; i++) {
-            char thread_hex[65];
-            sha256_final(&work[i].hash_ctx, thread_hex);
-            sha256_update(&master_hash, thread_hex, 64);
-        }
     }
 
     char master_hex[65];

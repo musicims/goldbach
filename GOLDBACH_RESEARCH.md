@@ -495,8 +495,8 @@ The ~39x speedup comes from three changes in the fast path:
 **Comparison to existing record:** Oliveira e Silva's verification to 4 × 10^18 used sieve-only — no Miller-Rabin, no BPSW. Fast mode uses the same fundamental approach with the addition of automatic dual MR+BPSW escalation on any shortcut failure.
 
 **Known limitations of fast mode:**
-- SHA-256 hash is computed from the run summary, not per-number certificates. Cannot be compared to dual mode hashes.
-- In dual mode, the SHA-256 hash depends on thread count (each thread hashes independently). Match thread count for hash comparison across runs.
+- SHA-256 hash is computed from the run summary (range, verified count, max attempts, counterexample), not per-number certificates. This makes hashes thread-count-independent and reproducible. Per-certificate integrity is available via `--cert` + `--verify`.
+- A resumed run's hash covers only the post-resume portion, so it won't match a clean full-range run. This is a known limitation of the checkpoint system.
 - Base prime generation allocates 1 byte per number up to sqrt(range_end). For range_end near 10^19, sqrt is ~4.3×10^9, requiring ~4GB. This may be an issue on memory-constrained machines.
 
 ---
@@ -543,10 +543,10 @@ The `--verify` flag does exactly this using dual primality (MR + BPSW), but any 
 
 | Range | SHA-256 |
 |-------|---------|
-| 4 to 10^8 | `4bad46c7978b742350a859af698fb54f170b5a6c50ca7031cdfd18d661261709` |
-| 4 to 10^9 | `b65507ab8e8362b605742fb86e5fbfa5b27897bd55a76860856b806018172b5e` |
+| 4 to 10^8 | `f844ac14048521df924728b71af778774627bc6059e79c34e38e8f18ef63116e` |
+| 4 to 10^9 | `5ef51e847dcce5c71a777c8959ce76cf04ef9bed083ef4bebc8c06f97eedfda3` |
 
-If you run the engine on the same range and get the same hash, that constitutes independent verification. If you get a different hash, something is wrong — file an issue.
+These hashes are computed from the run summary (range, verified count, max attempts, counterexample) and are identical regardless of thread count or whether `--fast` was used. If you run the engine on the same range and get the same hash, that constitutes independent verification. If you get a different hash, something is wrong — file an issue.
 
 ---
 
