@@ -62,7 +62,7 @@ static uint32_t *base_primes = NULL;
 static int num_base_primes = 0;
 
 /* ============================================================================
- * 128-BIT ARITHMETIC
+ * 128-BIT ARITHMETIC (for 64-bit numbers — used by sieve mode)
  * ============================================================================ */
 
 typedef unsigned __int128 uint128_t;
@@ -73,7 +73,7 @@ static inline uint64_t mulmod(uint64_t a, uint64_t b, uint64_t m) {
 
 static inline uint64_t addmod(uint64_t a, uint64_t b, uint64_t m) {
     uint64_t r = a + b;
-    if (r >= m || r < a) r -= m;  /* handle overflow */
+    if (r >= m || r < a) r -= m;
     return r;
 }
 
@@ -86,6 +86,53 @@ static inline uint64_t powmod(uint64_t base, uint64_t exp, uint64_t mod) {
         exp >>= 1;
         if (exp > 0)
             base = mulmod(base, base, mod);
+    }
+    return result;
+}
+
+/* ============================================================================
+ * WIDE ARITHMETIC (for numbers up to 10^24 — used by beyond mode)
+ * ============================================================================
+ *
+ * For numbers > 2^64 (~1.84×10^19), we need 128-bit N.
+ * mulmod128 uses binary multiplication to avoid needing 256-bit intermediates.
+ * Numbers up to ~3.3×10^24 (~2^82) are safe: addition of two 82-bit values
+ * fits in 128 bits, so addmod128 is overflow-safe.
+ */
+
+static inline uint128_t addmod128(uint128_t a, uint128_t b, uint128_t m) {
+    a %= m; b %= m;
+    /* a + b could overflow uint128 if both near 2^128, but since
+     * m < 2^82 (max 3.3×10^24), a and b are < 2^82, sum < 2^83. Safe. */
+    uint128_t r = a + b;
+    if (r >= m) r -= m;
+    return r;
+}
+
+static inline uint128_t mulmod128(uint128_t a, uint128_t b, uint128_t m) {
+    /* Binary (Russian peasant) multiplication mod m.
+     * Avoids 256-bit intermediates by reducing at each step.
+     * For m < 2^83, each addmod128 is safe. */
+    uint128_t result = 0;
+    a %= m;
+    while (b > 0) {
+        if (b & 1)
+            result = addmod128(result, a, m);
+        a = addmod128(a, a, m);
+        b >>= 1;
+    }
+    return result;
+}
+
+static inline uint128_t powmod128(uint128_t base, uint128_t exp, uint128_t mod) {
+    uint128_t result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1)
+            result = mulmod128(result, base, mod);
+        exp >>= 1;
+        if (exp > 0)
+            base = mulmod128(base, base, mod);
     }
     return result;
 }
@@ -297,6 +344,204 @@ static int is_prime_bpsw(uint64_t n) {
     int64_t D, P, Q;
     if (!selfridge_params(n, &D, &P, &Q)) return 0;
     return strong_lucas_test(n, D, P, Q);
+}
+
+/* ============================================================================
+ * WIDE (128-BIT) PRIMALITY TESTS
+ * ============================================================================
+ *
+ * Adaptive witness count:
+ *   n < 3.317×10^24:  12 witnesses (PROVEN correct, Sorenson & Webster 2015)
+ *   n >= 3.317×10^24: 24 witnesses (probabilistic, error < 1 in 10^14)
+ *                     + BPSW dual verification makes combined error negligible
+ *
+ * The switch is automatic. Users don't need to configure anything.
+ * Output clearly states which verification mode was used.
+ */
+
+/* 3.317 × 10^24 as uint128 — the proven boundary */
+/* 3.317 × 10^24 = 3317 × 10^21 */
+static const uint128_t MR_PROVEN_LIMIT =
+    (uint128_t)3317 * (uint128_t)1000000000000000000ULL *
+    (uint128_t)1000;
+
+/* 12 witnesses: proven correct below 3.317×10^24 */
+static const uint64_t MR_WITNESSES_12[] = {
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37
+};
+
+/* 24 witnesses: first 24 primes. Probability of false positive: < (1/4)^24 ≈ 3×10^-15.
+ * Combined with BPSW (independent method, zero known failures), the chance of
+ * both being wrong on the same number is not meaningfully distinguishable from zero. */
+static const uint64_t MR_WITNESSES_24[] = {
+    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37,
+    41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89
+};
+
+/* Track whether we entered probabilistic mode (for output) */
+static volatile int used_probabilistic_mode = 0;
+
+static int miller_rabin_witness_wide(uint128_t n, uint128_t a) {
+    if (n % a == 0) return (n == a);
+    uint128_t d = n - 1;
+    int r = 0;
+    while ((d & 1) == 0) { d >>= 1; r++; }
+    uint128_t x = powmod128(a, d, n);
+    if (x == 1 || x == n - 1) return 1;
+    for (int i = 0; i < r - 1; i++) {
+        x = mulmod128(x, x, n);
+        if (x == n - 1) return 1;
+    }
+    return 0;
+}
+
+static int is_prime_mr_wide(uint128_t n) {
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if (n % 2 == 0) return 0;
+
+    /* Select witness set based on whether n is in the proven range */
+    const uint64_t *witnesses;
+    int num_witnesses;
+
+    if (n < MR_PROVEN_LIMIT) {
+        witnesses = MR_WITNESSES_12;
+        num_witnesses = 12;
+    } else {
+        witnesses = MR_WITNESSES_24;
+        num_witnesses = 24;
+        used_probabilistic_mode = 1;
+    }
+
+    for (int i = 0; i < num_witnesses; i++) {
+        if (n == witnesses[i]) return 1;
+        if (n % witnesses[i] == 0) return 0;
+    }
+    for (int i = 0; i < num_witnesses; i++) {
+        if (!miller_rabin_witness_wide(n, witnesses[i]))
+            return 0;
+    }
+    return 1;
+}
+
+/* Wide Jacobi symbol — works with uint128_t n */
+static int jacobi_wide(int64_t a, uint128_t n) {
+    if (n <= 0 || n % 2 == 0) return 0;
+    if (n == 1) return 1;
+    int result = 1;
+    if (a < 0) { a = -a; if (n % 4 == 3) result = -result; }
+    uint128_t ua = (uint128_t)((uint64_t)a) % n;
+    if (ua == 0) return 0;
+    while (ua != 0) {
+        while (ua % 2 == 0) {
+            ua /= 2;
+            uint128_t nm8 = n % 8;
+            if (nm8 == 3 || nm8 == 5) result = -result;
+        }
+        if (ua % 4 == 3 && n % 4 == 3) result = -result;
+        uint128_t tmp = ua; ua = n; n = tmp;
+        ua = ua % n;
+    }
+    return (n == 1) ? result : 0;
+}
+
+static int selfridge_params_wide(uint128_t n, int64_t *D, int64_t *P, int64_t *Q) {
+    int64_t d = 5;
+    int sign = 1;
+    for (int i = 0; i < 100; i++) {
+        int j = jacobi_wide(d, n);
+        if (j == 0) {
+            uint64_t ad = (d < 0) ? (uint64_t)(-d) : (uint64_t)d;
+            if ((uint128_t)ad != n) return 0;
+        }
+        if (j == -1) {
+            *D = d; *P = 1; *Q = (1 - d) / 4;
+            return 1;
+        }
+        sign = -sign;
+        d = sign * ((d < 0 ? -d : d) + 2);
+    }
+    return 0;
+}
+
+static inline uint128_t to_mod_wide(int64_t val, uint128_t n) {
+    if (val >= 0) return (uint128_t)(uint64_t)val % n;
+    return n - ((uint128_t)(uint64_t)(-val) % n);
+}
+
+static int strong_lucas_test_wide(uint128_t n, int64_t D, int64_t P, int64_t Q) {
+    uint128_t np1 = n + 1;
+    int s = 0;
+    uint128_t d = np1;
+    while ((d & 1) == 0) { d >>= 1; s++; }
+
+    uint128_t Pm = to_mod_wide(P, n);
+    uint128_t Qm = to_mod_wide(Q, n);
+    uint128_t Dm = to_mod_wide(D, n);
+    uint128_t U = 1, V = Pm, Qk = Qm;
+
+    int bits = 0;
+    { uint128_t t = d; while (t > 0) { bits++; t >>= 1; } }
+
+    for (int i = bits - 2; i >= 0; i--) {
+        uint128_t U2 = mulmod128(U, V, n);
+        uint128_t V2 = mulmod128(V, V, n);
+        uint128_t twoQk = mulmod128(2, Qk, n);
+        V2 = addmod128(V2, n - twoQk, n);
+        Qk = mulmod128(Qk, Qk, n);
+        U = U2; V = V2;
+
+        if ((d >> i) & 1) {
+            uint128_t PU = mulmod128(Pm, U, n);
+            uint128_t sum_u = addmod128(PU, V, n);
+            if (sum_u % 2 != 0) sum_u = addmod128(sum_u, n, n); /* make even */
+            /* Divide by 2: if sum_u is even, just shift. Since n is odd,
+             * inv2 = (n+1)/2 is the modular inverse of 2. */
+            uint128_t inv2 = (n + 1) / 2;
+            uint128_t Un = mulmod128(addmod128(PU, V, n), inv2, n);
+
+            uint128_t DU = mulmod128(Dm, U, n);
+            uint128_t PV = mulmod128(Pm, V, n);
+            uint128_t Vn = mulmod128(addmod128(DU, PV, n), inv2, n);
+
+            U = Un; V = Vn;
+            Qk = mulmod128(Qk, Qm, n);
+        }
+    }
+
+    if (U == 0 || V == 0) return 1;
+    for (int r = 1; r < s; r++) {
+        V = mulmod128(V, V, n);
+        uint128_t twoQk2 = mulmod128(2, Qk, n);
+        V = addmod128(V, n - twoQk2, n);
+        if (V == 0) return 1;
+        Qk = mulmod128(Qk, Qk, n);
+    }
+    return 0;
+}
+
+static int is_perfect_square_wide(uint128_t n) {
+    /* Newton's method for integer square root */
+    if (n < 2) return n == 0 || n == 1;
+    uint128_t x = n, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return x * x == n;
+}
+
+static int is_prime_bpsw_wide(uint128_t n) {
+    if (n < 2) return 0;
+    if (n < 4) return 1;
+    if (n % 2 == 0) return 0;
+    static const uint32_t trial[] = {3,5,7,11,13,17,19,23,29,31,37,41,43,47,53};
+    for (int i = 0; i < 15; i++) {
+        if (n == trial[i]) return 1;
+        if (n % trial[i] == 0) return 0;
+    }
+    if (!miller_rabin_witness_wide(n, 2)) return 0;
+    if (is_perfect_square_wide(n)) return 0;
+    int64_t DD, PP, QQ;
+    if (!selfridge_params_wide(n, &DD, &PP, &QQ)) return 0;
+    return strong_lucas_test_wide(n, DD, PP, QQ);
 }
 
 /* ============================================================================
@@ -645,23 +890,52 @@ static void *verify_range_thread(void *arg) {
  * ============================================================================ */
 
 typedef struct {
-    uint64_t n, p, q;
+    uint128_t n, p, q;
     int attempts;
     int dual_ok;
 } BeyondResult;
 
-static BeyondResult test_goldbach_single(uint64_t n) {
-    BeyondResult res = {n, 0, 0, 0, 0};
+/* Helper to print uint128 into a buffer */
+static int sprint_u128(char *buf, size_t sz, uint128_t v) {
+    if (v <= UINT64_MAX)
+        return snprintf(buf, sz, "%" PRIu64, (uint64_t)v);
+    /* For larger values, build decimal string */
+    char tmp[50];
+    int pos = 0;
+    uint128_t rem = v;
+    if (rem == 0) { tmp[pos++] = '0'; }
+    while (rem > 0) { tmp[pos++] = '0' + (int)(rem % 10); rem /= 10; }
+    int len = 0;
+    for (int i = pos - 1; i >= 0 && len < (int)sz - 1; i--)
+        buf[len++] = tmp[i];
+    buf[len] = 0;
+    return len;
+}
+
+static BeyondResult test_goldbach_single_wide(uint128_t n) {
+    BeyondResult res;
+    res.n = n; res.p = 0; res.q = 0; res.attempts = 0; res.dual_ok = 0;
+
     for (int i = 0; i < num_small_primes; i++) {
-        uint64_t p = small_primes[i];
+        uint128_t p = small_primes[i];
         if (p >= n) break;
         res.attempts++;
-        uint64_t q = n - p;
-        /* DUAL VERIFICATION */
-        int mr = is_prime_miller_rabin(q);
-        int bpsw = is_prime_bpsw(q);
+        uint128_t q = n - p;
+
+        /* DUAL VERIFICATION — use wide or narrow depending on size */
+        int mr, bpsw;
+        if (q <= UINT64_MAX) {
+            mr = is_prime_miller_rabin((uint64_t)q);
+            bpsw = is_prime_bpsw((uint64_t)q);
+        } else {
+            mr = is_prime_mr_wide(q);
+            bpsw = is_prime_bpsw_wide(q);
+        }
+
         if (mr != bpsw) {
-            fprintf(stderr, "\n*** DUAL FAILURE at q=%" PRIu64 " ***\n", q);
+            char qbuf[50];
+            sprint_u128(qbuf, sizeof(qbuf), q);
+            fprintf(stderr, "\n*** DUAL FAILURE at q=%s ***\n", qbuf);
             exit(2);
         }
         if (mr) {
@@ -864,7 +1138,7 @@ static int run_self_tests(void) {
             5000000000000000000ULL, 9999999999999999998ULL};
         int ok = 1;
         for (int i = 0; i < 4; i++) {
-            BeyondResult r = test_goldbach_single(tv[i]);
+            BeyondResult r = test_goldbach_single_wide((uint128_t)tv[i]);
             if (!r.dual_ok) { printf(" FAIL at %" PRIu64 "\n", tv[i]); ok = 0; break; }
             if (r.p + r.q != tv[i]) { printf(" FAIL: sum mismatch\n"); ok = 0; break; }
         }
@@ -1145,11 +1419,11 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
     free(work);
 }
 
-static void run_beyond(int num_samples, const char *cert_file) {
-    printf("MODE: Beyond-record (dual-verified)\n");
+static void run_beyond(int num_samples, const char *cert_file,
+                       uint128_t custom_lo, uint128_t custom_hi) {
+    printf("MODE: Beyond-record sampling (dual-verified)\n");
     printf("Samples: %d\n", num_samples);
     if (cert_file) printf("Certificate file: %s\n", cert_file);
-    printf("\n");
 
     generate_base_primes(100000);
 
@@ -1168,16 +1442,34 @@ static void run_beyond(int num_samples, const char *cert_file) {
     SHA256 hash;
     sha256_init(&hash);
 
-    typedef struct { const char *label; uint64_t lo, range; } TR;
-    TR ranges[] = {
-        {"4×10^18 + random",  4000000000000000000ULL, 1000000000000ULL},
-        {"5×10^18 + random",  5000000000000000000ULL, 1000000000000ULL},
-        {"10^19 + random",   10000000000000000000ULL, 1000000000000ULL},
-    };
-    int nranges = sizeof(ranges) / sizeof(ranges[0]);
+    /* Build sampling ranges — use custom range if provided, otherwise defaults */
+    typedef struct { char label[64]; uint128_t lo, range; } TR;
+    TR ranges[4];
+    int nranges;
+
+    if (custom_lo > 0 && custom_hi > custom_lo) {
+        nranges = 1;
+        ranges[0].lo = custom_lo;
+        ranges[0].range = custom_hi - custom_lo;
+        snprintf(ranges[0].label, sizeof(ranges[0].label),
+                 "%.3e to %.3e", (double)custom_lo, (double)custom_hi);
+        printf("Sampling range: %s\n\n", ranges[0].label);
+    } else {
+        nranges = 3;
+        ranges[0].lo = (uint128_t)4000000000000000000ULL;
+        ranges[0].range = 1000000000000ULL;
+        snprintf(ranges[0].label, sizeof(ranges[0].label), "4×10^18 + random");
+        ranges[1].lo = (uint128_t)5000000000000000000ULL;
+        ranges[1].range = 1000000000000ULL;
+        snprintf(ranges[1].label, sizeof(ranges[1].label), "5×10^18 + random");
+        ranges[2].lo = (uint128_t)10000000000000000000ULL;
+        ranges[2].range = 1000000000000ULL;
+        snprintf(ranges[2].label, sizeof(ranges[2].label), "10^19 + random");
+        printf("Sampling default zones past 4×10^18 record\n\n");
+    }
 
     int g_max_att = 0;
-    uint64_t g_max_n = 0;
+    uint128_t g_max_n = 0;
     int total = 0, total_pass = 0;
 
     for (int r = 0; r < nranges; r++) {
@@ -1188,21 +1480,30 @@ static void run_beyond(int num_samples, const char *cert_file) {
 
         int spr = num_samples / nranges;
         for (int i = 0; i < spr; i++) {
-            uint64_t n = ranges[r].lo + (uint64_t)(drand48() * ranges[r].range);
+            /* Generate random offset using two 32-bit randoms combined.
+             * drand48 gives 48 bits of randomness; for 128-bit ranges we
+             * combine two calls for a 64-bit random offset within range. */
+            uint64_t r1 = (uint64_t)(drand48() * 4294967296.0);  /* 32 bits */
+            uint64_t r2 = (uint64_t)(drand48() * 4294967296.0);  /* 32 bits */
+            uint64_t rand64 = (r1 << 32) | r2;
+            uint128_t offset = (uint128_t)rand64 % ranges[r].range;
+            uint128_t n = ranges[r].lo + offset;
             if (n % 2) n++;
             if (n < 4) n = 4;
 
-            BeyondResult res = test_goldbach_single(n);
+            BeyondResult res = test_goldbach_single_wide(n);
             tatt += res.attempts;
             if (res.dual_ok) {
                 total_pass++;
-                char cert[128];
-                int len = snprintf(cert, sizeof(cert),
-                    "%" PRIu64 "=%" PRIu64 "+%" PRIu64 "\n", n, res.p, res.q);
+                char nbuf[50], pbuf[50], qbuf[50], cert[160];
+                sprint_u128(nbuf, sizeof(nbuf), res.n);
+                sprint_u128(pbuf, sizeof(pbuf), res.p);
+                sprint_u128(qbuf, sizeof(qbuf), res.q);
+                int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nbuf, pbuf, qbuf);
                 sha256_update(&hash, cert, len);
                 if (cf) fputs(cert, cf);
             } else { fails++; }
-            if (res.attempts > rmax) { rmax = res.attempts; g_max_n = n; }
+            if (res.attempts > rmax) { rmax = res.attempts; g_max_n = res.n; }
             total++;
         }
 
@@ -1216,6 +1517,8 @@ static void run_beyond(int num_samples, const char *cert_file) {
 
     char hex[65];
     sha256_final(&hash, hex);
+    char max_n_buf[50];
+    sprint_u128(max_n_buf, sizeof(max_n_buf), g_max_n);
 
     if (cf) {
         fprintf(cf, "# SHA-256: %s\n", hex);
@@ -1228,11 +1531,19 @@ static void run_beyond(int num_samples, const char *cert_file) {
     printf("====================================================================\n");
     printf("  Total tested:   %d\n", total);
     printf("  Total passed:   %d\n", total_pass);
-    printf("  Max attempts:   %d (at N=%" PRIu64 ")\n", g_max_att, g_max_n);
+    printf("  Max attempts:   %d (at N=%s)\n", g_max_att, max_n_buf);
     printf("  SHA-256:        %s\n", hex);
-    printf("  Dual method:    Miller-Rabin + BPSW (both agreed on every test)\n");
+    if (used_probabilistic_mode) {
+        printf("  Verification:   PROBABILISTIC (numbers exceed 3.317×10^24)\n");
+        printf("  Method:         MR (24 witnesses) + BPSW — error < 10^-14\n");
+        printf("                  24 independent MR witnesses + independent Lucas test.\n");
+        printf("                  No known number fools both methods simultaneously.\n");
+    } else {
+        printf("  Verification:   PROVEN (all numbers below 3.317×10^24)\n");
+        printf("  Method:         MR (12 witnesses, deterministic) + BPSW\n");
+    }
     if (total_pass == total)
-        printf("  All numbers past 4×10^18 satisfy Goldbach.\n");
+        printf("  All tested numbers satisfy Goldbach.\n");
     printf("====================================================================\n");
 }
 
@@ -1290,7 +1601,7 @@ static void interactive_menu(void) {
             run_exhaustive_range(4, 100000000000ULL, cores);
             break;
         case 5:
-            run_beyond(100000, "goldbach_certificates.txt");
+            run_beyond(100000, "goldbach_certificates.txt", 0, 0);
             break;
         case 6: {
             uint64_t start, end;
@@ -1329,21 +1640,39 @@ static void interactive_menu(void) {
 
 static void print_usage(const char *prog) {
     printf("Usage:\n\n");
+    printf("MODES:\n\n");
     printf("  %s                              Interactive menu\n", prog);
-    printf("  %s LIMIT [THREADS]              Verify 4 to LIMIT\n", prog);
-    printf("  %s --range START END [THREADS]  Verify a specific range (for clusters)\n", prog);
-    printf("  %s --beyond [N] [--cert FILE]   Sample N numbers past 4×10^18\n", prog);
-    printf("  %s --verify FILE                Verify a certificate file\n", prog);
-    printf("  %s --selftest                   Run self-tests only\n", prog);
-    printf("\nOptions:\n\n");
-    printf("  --checkpoint FILE               Auto-save progress every 60s, resume on restart\n");
-    printf("\nExamples:\n\n");
-    printf("  %s 1e10 8                       10 billion, 8 threads\n", prog);
-    printf("  %s --range 1e15 2e15 16         Cluster node: range [10^15, 2×10^15]\n", prog);
-    printf("  %s --beyond 100000              100K samples past record\n", prog);
-    printf("\nThe --range flag enables distributed verification across multiple\n");
-    printf("machines. Each machine handles a sub-range independently. Combine\n");
-    printf("SHA-256 hashes from all nodes to verify completeness.\n");
+    printf("  %s LIMIT [THREADS]              Exhaustive: verify every even N from 4 to LIMIT\n", prog);
+    printf("  %s --range START END [THREADS]  Exhaustive: verify a sub-range (for clusters)\n", prog);
+    printf("  %s --beyond COUNT [LO HI]       Sampling: test COUNT random numbers in [LO,HI]\n", prog);
+    printf("  %s --verify FILE                Verify: check a certificate file independently\n", prog);
+    printf("  %s --selftest                   Self-test: validate all components\n", prog);
+    printf("\nOPTIONS:\n\n");
+    printf("  --checkpoint FILE   Auto-save progress every 60s, resume on restart\n");
+    printf("  --cert FILE         Write certificates to FILE (used with --beyond)\n");
+    printf("  THREADS             Number of threads (default: auto-detect all cores)\n");
+    printf("\nEXAMPLES:\n\n");
+    printf("  # Exhaustive verification\n");
+    printf("  %s 1e10                         Verify up to 10 billion (all cores)\n", prog);
+    printf("  %s 1e10 8                       Verify up to 10 billion (8 threads)\n", prog);
+    printf("  %s 1e12 --checkpoint p.txt      Long run with auto-save/resume\n", prog);
+    printf("\n  # Cluster mode (split across machines)\n");
+    printf("  %s --range 0 1e15               Machine 1\n", prog);
+    printf("  %s --range 1e15 2e15            Machine 2\n", prog);
+    printf("\n  # Sampling past the world record (4×10^18)\n");
+    printf("  %s --beyond 100000              100K samples from default zones\n", prog);
+    printf("  %s --beyond 1e6 4e18 5e18       1M samples in [4×10^18, 5×10^18]\n", prog);
+    printf("  %s --beyond 100000 1e20 1e21    100K samples in [10^20, 10^21]\n", prog);
+    printf("  %s --beyond 50000 1e23 1e24 --cert certs.txt\n", prog);
+    printf("                                      50K samples near 10^24 with certificates\n");
+    printf("\n  # Verify someone else's certificates\n");
+    printf("  %s --verify certificates.txt    Dual-checks every line\n", prog);
+    printf("\nNOTES:\n\n");
+    printf("  Numbers accept scientific notation: 1e10, 4e18, 1e24\n");
+    printf("  --range max: ~1.84×10^19 (uint64, sieve-based)\n");
+    printf("  --beyond: proven correct to 3.317×10^24, probabilistic beyond\n");
+    printf("            (auto-switches to 24 MR witnesses + BPSW past the proof limit)\n");
+    printf("  --range enables distributed verification — no inter-node communication\n");
 }
 
 int main(int argc, char **argv) {
@@ -1358,6 +1687,7 @@ int main(int argc, char **argv) {
     int selftest_only = 0, beyond_mode = 0, range_mode = 0;
     int beyond_count = 10000;
     uint64_t range_start = 4, range_end = 1000000000ULL;
+    uint128_t beyond_lo = 0, beyond_hi = 0;  /* 0 = use defaults */
     int num_threads = detect_cores();
     const char *verify_file = NULL;
     const char *cert_file = NULL;
@@ -1367,8 +1697,27 @@ int main(int argc, char **argv) {
             selftest_only = 1;
         } else if (strcmp(argv[i], "--beyond") == 0) {
             beyond_mode = 1;
-            if (i+1 < argc && argv[i+1][0] != '-')
-                beyond_count = (int)strtod(argv[++i], NULL);
+            /* Parse: --beyond COUNT [LO HI]
+             * COUNT is required, LO and HI are optional positional args */
+            if (i+1 < argc && argv[i+1][0] != '-') {
+                beyond_count = (int)strtod(argv[i+1], NULL);
+                i++;
+            }
+            if (i+1 < argc && i+2 < argc &&
+                argv[i+1][0] != '-' && argv[i+2][0] != '-') {
+                double lo_d = strtod(argv[i+1], NULL);
+                double hi_d = strtod(argv[i+2], NULL);
+                /* Hard limit: ~3.4×10^38 (uint128 max), but practically
+                 * limited by mulmod128 needing a+b < 2^128. Safe up to ~10^37.
+                 * Past 3.317×10^24 the engine auto-switches to 24 witnesses. */
+                if (hi_d > 1e37) {
+                    fprintf(stderr, "Warning: HI clamped to 10^37 (uint128 arithmetic limit)\n");
+                    hi_d = 1e37;
+                }
+                beyond_lo = (uint128_t)lo_d;
+                beyond_hi = (uint128_t)hi_d;
+                i += 2;
+            }
         } else if (strcmp(argv[i], "--range") == 0) {
             range_mode = 1;
             if (i+1 < argc) range_start = (uint64_t)strtod(argv[++i], NULL);
@@ -1413,7 +1762,7 @@ int main(int argc, char **argv) {
 
     if (beyond_mode) {
         if (!cert_file) cert_file = "goldbach_certificates.txt";
-        run_beyond(beyond_count, cert_file);
+        run_beyond(beyond_count, cert_file, beyond_lo, beyond_hi);
     } else {
         if (range_start < 4) range_start = 4;
         if (range_start % 2) range_start++;
