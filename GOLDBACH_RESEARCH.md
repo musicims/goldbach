@@ -6,7 +6,6 @@ A well-engineered implementation of known techniques for Goldbach verification �
 
 **Status:** Tool complete. No records set yet — verified exhaustively to 10^10, sampled to 10^24. Scaling estimates are projections.
 **Repository:** https://github.com/musicims/goldbach
-**Started:** 2026-03-17
 
 ---
 
@@ -115,6 +114,27 @@ Method:         MR (24 witnesses) + BPSW — error < 10^-14
 ```
 
 **Speed cost:** 24 witnesses vs 12 is ~40% slower for Miller-Rabin, ~30% slower overall (BPSW is unchanged). This only affects `--beyond` mode at extreme scales — exhaustive `--range` mode never encounters numbers this large.
+
+---
+
+## Comparison with Oliveira e Silva (2012)
+
+The current record holder used a different methodology. Understanding the differences matters for anyone evaluating whether this tool's results could credibly extend that record.
+
+| Aspect | Oliveira e Silva (2012) | This tool |
+|--------|------------------------|-----------|
+| Primality testing | Sieve lookup only (~10 cycles per test) | Dual: Miller-Rabin + BPSW |
+| Verification | Single method; validated by comparing prime counts per interval against independent π(x) computation | Dual method: two independent tests must agree on every result |
+| Inner loop | Partly hand-written x86 assembly | Pure portable C |
+| Certificate output | Aggregate tables (minimal partitions, counts) | Individual N=p+q certificates with SHA-256 |
+| Reproducibility | Results tables published | Per-number certificates + hash; independent `--verify` mode |
+| Cluster support | Distributed across machines | Built-in `--range` with checkpointing |
+| Speed (per core) | ~10 cycles per primality check (sieve) | ~hundreds of cycles (MR+BPSW) |
+| Total compute | ~782 CPU-years | Not yet run at scale |
+
+**Key difference:** Oliveira e Silva's approach is faster per number because sieve lookups are cheaper than Miller-Rabin + BPSW. Our approach is slower but produces stronger per-number evidence (dual-verified certificates). The methodologies are compatible — both verify that N-p is prime for some small p. Results from either tool confirm the same mathematical fact about each even number.
+
+**Extending the record:** If this tool produces certificates for even numbers past 4 × 10^18, those results are methodologically independent of (and arguably more rigorous than) the original verification, since each number is individually dual-checked rather than validated in aggregate.
 
 ---
 
@@ -259,9 +279,9 @@ Tier 3 has never triggered. If it ever does, the result is airtight — every ca
 
 The `--suspect` mode constructs numbers designed to be as difficult as possible for the small-prime shortcut. Each number N is chosen so that N ≡ 5738 mod 30030 (the primorial 2×3×5×7×11×13), an optimally selected residue class found by exhaustive search over all 15,015 even residue classes. This construction guarantees that N-p shares a factor with the primorial for 233 out of the first 300 small primes — meaning N-p is provably composite for those primes, forcing the shortcut to search further.
 
-**Result:** Even these maximally adversarial numbers only require ~1.7-2.1x more attempts than random inputs, across all scales tested (10^18 to 10^24). 5,000 adversarial numbers at 10^18 scale: all pass, average 43 attempts vs ~25 for random.
+**Empirical result:** Even these maximally adversarial numbers only require ~1.7-2.1x more attempts than random inputs, across all scales tested (10^18 to 10^24). 5,000 adversarial numbers at 10^18 scale: all pass, average 43 attempts vs ~25 for random. 1,000 adversarial numbers at 10^24: all pass, average 52 attempts.
 
-**Why this ceiling exists:** The shortcut's effectiveness comes from the density of prime numbers in the integers, which is a property of the number line itself — not of the algorithm. The Prime Number Theorem guarantees roughly 1/ln(N) of numbers near N are prime. For each small prime p we try, N-p has an independent ~1/ln(N) chance of being prime. No construction — CRT, primorial, or otherwise — can change this fundamental density. You can force specific N-p values to be composite, but you cannot thin out the primes in the neighborhood as a whole.
+**Why this ceiling exists (empirically):** We tested the optimal CRT construction — the one that eliminates the most small primes (233 out of 300) — and it only doubled the difficulty. Increasing the number of CRT conditions doesn't help because the primorial modulus grows faster than the benefit. At some point, the surviving primes (those not eliminated by the construction) are still dense enough to provide Goldbach pairs quickly. The data shows this holds at every scale tested. The theoretical explanation involves prime density (the Prime Number Theorem), but the independence assumptions required to formalize it are exactly the ones that make Goldbach hard to prove — so we rely on the empirical evidence rather than the heuristic argument.
 
 This means:
 - The shortcut is robust against worst-case inputs, not just favorable random ones
@@ -398,15 +418,20 @@ Unlike y-cruncher (single-machine only), Goldbach verification is embarrassingly
 
 ```bash
 # deploy.sh — assign ranges to machines
-TOTAL=4000000000000000000  # 4×10^18 (current record)
+# NOTE: bash arithmetic overflows at 2^63 (~9.2×10^18).
+# Use Python for range computation at large scales.
+TOTAL="4000000000000000000"  # 4×10^18
 N_MACHINES=100
-CHUNK=$((TOTAL / N_MACHINES))
 
-for i in $(seq 0 $((N_MACHINES - 1))); do
-    START=$((i * CHUNK))
-    END=$(((i + 1) * CHUNK))
-    ssh node$i "cd goldbach && ./goldbach --range $START $END --checkpoint node${i}.txt" &
-done
+python3 -c "
+total = $TOTAL
+n = $N_MACHINES
+chunk = total // n
+for i in range(n):
+    start = i * chunk
+    end = (i + 1) * chunk if i < n - 1 else total
+    print(f'ssh node{i} \"cd goldbach && ./goldbach --range {start} {end} --checkpoint node{i}.txt\" &')
+" | bash
 ```
 
 Each node outputs a SHA-256 hash. Combine all hashes to verify full coverage. See [README.md](README.md#scaling-estimates) for multi-machine scaling estimates.
@@ -441,7 +466,7 @@ where C₂ is the twin prime constant (~0.66). This predicts r(N) grows without 
 
 The correlation structure is precisely why a naive probability argument fails as a proof. Sieve theory (the large sieve inequality, Bombieri-Vinogradov theorem) can bound the correlations but has not yet been strong enough to close the gap. Chen's theorem (1973) — every large even N = prime + semiprime — represents the current frontier of what sieve methods can prove.
 
-The open question is whether computational verification, combined with explicit bounds on the singular series for N below some threshold, could create a hybrid proof: "for N below X, we've checked; for N above X, the analytic bounds guarantee enough representations." This would require both pushing the exhaustive range further and tightening the analytic bounds — neither of which this project addresses, but both of which this tool could support.
+A theoretical direction would be a hybrid proof: "for N below X, we've checked; for N above X, analytic bounds guarantee enough representations." However, current analytic results only guarantee sufficient Goldbach representations for extremely large N — far beyond what any computation could bridge to. The gap between "what's computationally reachable" (optimistically 10^19 to 10^20 in the near term) and "where analytic bounds become effective" is not well-characterized but is likely astronomical. This remains a thought experiment, not an actionable research program, until significant advances are made on the analytic side.
 
 ### 4. Extending the Miller-Rabin proof boundary
 
@@ -456,6 +481,34 @@ These are implementation improvements rather than research questions:
 - **GPU acceleration.** The sieve and per-number checks are SIMD-friendly. A CUDA port could push throughput significantly, even with dual verification.
 - **Single-method fast mode.** Re-expose the v1.0 architecture (Miller-Rabin only, still proven deterministic) as a `--fast` flag for exploratory runs where dual verification isn't needed. This runs at ~312M/sec vs ~7M/sec.
 - **Multi-prime NTT.** Using Chinese Remainder Theorem across multiple NTT primes would allow exact convolution for arbitrarily large ranges in the research prototype.
+
+---
+
+## Certificate Format Specification
+
+Certificate files are plain UTF-8 text. Anyone implementing an independent verifier needs only this specification:
+
+```
+# Lines starting with '#' are comments.
+# The file contains one Goldbach pair per line:
+# N=p+q
+# where N is an even number > 2, and p, q are both prime, and p + q = N.
+# All values are decimal integers. No leading zeros.
+# The last comment line contains the SHA-256 hash of all non-comment lines
+# concatenated (including trailing newlines).
+
+4000000034090013316=23+4000000034090013293
+4000000315656127732=431+4000000315656127301
+4000000560634671982=3+4000000560634671979
+# SHA-256: 86128dcfc2cc7dec6f18a2b152ea29ca1772c6ef25246a441ecbb648398530d2
+```
+
+**To verify a certificate independently:**
+1. For each line `N=p+q`: confirm p is prime, confirm q is prime, confirm p + q = N.
+2. Use any primality test you trust — you do not need this tool.
+3. Recompute the SHA-256 hash of all non-comment lines to confirm integrity.
+
+The `--verify` flag does exactly this using dual primality (MR + BPSW), but any implementation that checks these three conditions is equally valid.
 
 ---
 

@@ -146,7 +146,7 @@ If they **ever disagree**, the program halts immediately.
 
 The engine can generate numbers specifically constructed to be as hard as possible for the Goldbach shortcut. Using the Chinese Remainder Theorem with an optimally chosen residue class (N ≡ 5738 mod 30030, the primorial of 2×3×5×7×11×13), each number is built so that N-p shares a factor with the primorial for 233 out of 300 small primes — guaranteeing N-p is composite for most initial attempts.
 
-The result: even these worst-case numbers only require ~1.7-2x more attempts than random inputs. This is not an engineering limitation — it is a mathematical ceiling. Prime density is a property of the integers themselves, not something any construction can circumvent. No matter how adversarially you choose N, there are always enough primes near N-p to find a Goldbach pair within O(log N) attempts.
+The result: even these worst-case numbers only require ~1.7-2x more attempts than random inputs, across all scales tested from 10^18 to 10^24. Increasing the number of CRT conditions doesn't help — the primorial modulus grows faster than the benefit, and surviving primes remain dense enough to provide pairs quickly. This ~2x ceiling appears to be fundamental rather than an engineering limitation.
 
 This means the shortcut is robust against worst-case inputs, not just favorable ones. Exhaustive `--range` verification (testing every number sequentially) remains the strongest form of evidence, but `--suspect` demonstrates that targeted attacks on the algorithm don't work.
 
