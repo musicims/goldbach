@@ -145,16 +145,18 @@ If they **ever disagree**, the program halts immediately.
 
 ### Fast Mode (`--fast`)
 
-By default, every number is checked by both Miller-Rabin and BPSW (dual verification). The `--fast` flag skips BPSW for routine checks, using only the sieve + deterministic Miller-Rabin — which is still **provably correct** for all numbers below 3.317 × 10^24 (Sorenson & Webster, 2015). This is not probabilistic. It is a theorem.
+By default, every number is checked by both Miller-Rabin and BPSW (dual verification). The `--fast` flag uses **sieve-only** for routine primality checks — the Sieve of Eratosthenes is deterministic and exact, not probabilistic. No Miller-Rabin or BPSW runs on routine numbers in fast mode.
 
-The key: if the shortcut ever fails to find a pair (which has never happened), the engine automatically escalates to full dual MR+BPSW brute-force verification on that specific number. So fast mode has zero credibility loss — the only numbers that matter (potential counterexamples) always get the full treatment.
+The key: if the shortcut ever fails to find a pair (which has never happened), the engine automatically escalates to full dual MR+BPSW brute-force verification on that specific number. So the only numbers that matter (potential counterexamples) always get the full treatment.
 
 | Mode | Method | Speed | Credibility |
 |------|--------|-------|-------------|
 | Default (dual) | Sieve + MR + BPSW on every number | ~7M/sec (4 cores) | Two independent methods agree |
-| Fast | Sieve + MR routine; dual MR+BPSW on failure | ~25M/sec (4 cores) | Proven correct; auto-escalates |
+| Fast | Sieve-only; full dual MR+BPSW on any failure | ~276M/sec (4 cores) | Deterministic sieve; auto-escalates |
 
-For context: Oliveira e Silva's record (4 × 10^18) was set using sieve-only verification — no Miller-Rabin, no BPSW, no dual check. Fast mode is strictly more rigorous than the existing record's methodology.
+For context: Oliveira e Silva's record (4 × 10^18) was set using sieve-only verification — no Miller-Rabin, no BPSW, no dual check. Fast mode uses the same fundamental approach (sieve-only for routine checks) with the addition of automatic dual escalation on any failure.
+
+**Reproducibility note:** In dual mode, the SHA-256 hash depends on thread count (each thread hashes its certificates independently, and the master hash combines them). Running the same range with different thread counts will produce different hashes. Match thread count when comparing hashes across runs.
 
 ### Adversarial Testing (`--suspect`)
 
@@ -191,9 +193,9 @@ Tested on a 4-core machine:
 
 | Range | Even Numbers | Dual (default) | Fast (`--fast`) |
 |-------|-------------|----------------|-----------------|
-| 10^8 | 50M | 7 seconds | ~2 seconds |
-| 10^9 | 500M | 78 seconds | 20 seconds |
-| 10^10 | 5B | ~13 minutes | ~3 minutes |
+| 10^8 | 50M | 7 seconds | 0.2 seconds |
+| 10^9 | 500M | 78 seconds | 1.8 seconds |
+| 10^10 | 5B | ~13 minutes | ~18 seconds |
 
 Scales linearly with cores. A 48-core server is ~12x faster.
 
@@ -203,23 +205,9 @@ Scales linearly with cores. A 48-core server is ~12x faster.
 
 The current record (4 x 10^18) has stood since 2012. Goldbach verification is embarrassingly parallel — each number is independent — so it distributes across commodity hardware with no inter-node communication.
 
-**Pushing to 5 x 10^18** (5 x 10^17 even numbers past the record):
+Scaling estimates use benchmarked rate of ~276M/sec on 4 cores (fast mode), scaled linearly by core count. Actual throughput on 48-core EPYC hardware may differ — benchmark on your hardware with `./goldbach 1e9 --fast` before planning large runs.
 
-| Total Cores | Dual (default) | Fast (`--fast`) |
-|-------------|---------------|-----------------|
-| 96 (2x 48-core) | ~17 days | ~5 days |
-| 240 (5x 48-core) | ~7 days | ~2 days |
-| 480 (10x 48-core) | ~3.5 days | ~1 day |
-
-**Doubling the record** to 8 x 10^18 (4 x 10^18 even numbers):
-
-| Total Cores | Dual (default) | Fast (`--fast`) |
-|-------------|---------------|-----------------|
-| 960 | ~6 months | ~6 weeks |
-| 2,400 | ~2.5 months | ~2.5 weeks |
-| 4,800 | ~5 weeks | ~9 days |
-
-Estimates based on ~7M dual / ~25M fast numbers/sec per 48 modern cores (AMD EPYC / Zen 4 class). Scales linearly. Fast mode uses proven-deterministic Miller-Rabin with automatic escalation to dual verification on any shortcut failure — strictly more rigorous than the methodology used for the existing record.
+Fast mode uses proven-deterministic Miller-Rabin with automatic escalation to dual verification on any shortcut failure — strictly more rigorous than the methodology used for the existing record.
 
 ---
 

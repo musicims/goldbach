@@ -476,7 +476,7 @@ The current deterministic boundary (3.317 × 10^24, Sorenson & Webster 2015) has
 
 ## Fast Mode (`--fast`)
 
-The `--fast` flag skips BPSW for routine tier-1 checks, using only sieve + deterministic Miller-Rabin. This is still **provably correct** — deterministic MR with 12 witnesses is a theorem (Sorenson & Webster, 2015), not a probabilistic test.
+The `--fast` flag uses **sieve-only** for routine tier-1 primality checks. No Miller-Rabin or BPSW is called for routine numbers — the sieve lookup is the sole primality test. The Sieve of Eratosthenes is deterministic and exact (not probabilistic), provided the implementation is correct. Sieve correctness is validated by self-test #5 (sieve vs dual primality agreement on 100,000 numbers).
 
 If the shortcut ever exhausts without finding a pair, the engine automatically escalates to full dual MR+BPSW brute-force on that specific number (tiers 2-3). This means fast mode has the same correctness guarantees as dual mode for any number that matters.
 
@@ -485,11 +485,19 @@ If the shortcut ever exhausts without finding a pair, the engine automatically e
 | Mode | Rate | 1 Billion (10^9) |
 |------|------|------------------|
 | Dual (default) | ~7M/sec | 78 seconds |
-| Fast | ~25M/sec | 20 seconds |
+| Fast (optimized) | ~276M/sec | 1.8 seconds |
 
-The speedup is ~3.5x on small ranges (sieve-dominated) and widens toward ~40x at larger scales where primality testing dominates.
+The ~39x speedup comes from three changes in the fast path:
+1. No BPSW on routine checks (tiers 2-3 still use full dual)
+2. No SHA-256 hashing or string formatting per number
+3. Inlined sieve lookup with unrolled first 8 prime checks
 
-**Comparison to existing record:** Oliveira e Silva's verification to 4 × 10^18 used sieve-only — no Miller-Rabin, no BPSW. Fast mode is strictly more rigorous than the existing record's methodology, while being dramatically faster than our default dual mode.
+**Comparison to existing record:** Oliveira e Silva's verification to 4 × 10^18 used sieve-only — no Miller-Rabin, no BPSW. Fast mode uses the same fundamental approach with the addition of automatic dual MR+BPSW escalation on any shortcut failure.
+
+**Known limitations of fast mode:**
+- SHA-256 hash is computed from the run summary, not per-number certificates. Cannot be compared to dual mode hashes.
+- In dual mode, the SHA-256 hash depends on thread count (each thread hashes independently). Match thread count for hash comparison across runs.
+- Base prime generation allocates 1 byte per number up to sqrt(range_end). For range_end near 10^19, sqrt is ~4.3×10^9, requiring ~4GB. This may be an issue on memory-constrained machines.
 
 ---
 
