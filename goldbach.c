@@ -40,6 +40,9 @@
 #include <pthread.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <signal.h>
+#include <termios.h>
+#include <fcntl.h>
 
 /* ============================================================================
  * CONFIGURATION
@@ -729,6 +732,44 @@ static inline int seg_is_prime(const SegmentedSieve *seg, uint64_t n) {
 }
 
 /* ============================================================================
+ * STOP / INTERRUPT HANDLING
+ * ============================================================================ */
+
+static volatile int stop_requested = 0;
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    stop_requested = 1;
+    signal(SIGINT, sigint_handler);
+}
+
+/* Keypress detection using FIONREAD */
+#include <sys/ioctl.h>
+
+static int kbhit(void) {
+    int bytes = 0;
+    ioctl(STDIN_FILENO, FIONREAD, &bytes);
+    return bytes > 0;
+}
+
+static void start_input_monitor(void) {
+    system("stty raw -echo");
+}
+
+static void stop_input_monitor(void) {
+    system("stty cooked echo");
+}
+
+static void check_for_stop(void) {
+    if (kbhit()) {
+        char c = getchar();
+        if (c == 'q' || c == 'Q' || c == 27 || c == 3) {
+            stop_requested = 1;
+        }
+    }
+}
+
+/* ============================================================================
  * GOLDBACH VERIFICATION — THREAD WORKER
  * ============================================================================ */
 
@@ -771,7 +812,7 @@ static void *verify_range_thread(void *arg) {
     seg.bits = sieve_buf;
 
     uint64_t seg_lo = lo;
-    while (seg_lo <= hi) {
+    while (seg_lo <= hi && !stop_requested) {
         uint64_t sieve_lo = (seg_lo > margin) ? seg_lo - margin : 2;
         uint64_t sieve_hi = seg_lo + check_range;
         if (sieve_hi > hi) sieve_hi = hi;
@@ -802,7 +843,7 @@ static void *verify_range_thread(void *arg) {
                  !( sieve_bits[((q) - sieve_base) >> 4] & \
                     (1u << ((((q) - sieve_base) >> 1) & 7)) ))
 
-            for (uint64_t n = seg_lo; n <= check_hi; n += 2) {
+            for (uint64_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
 
@@ -886,8 +927,8 @@ static void *verify_range_thread(void *arg) {
                 work->current_n = n;
             }
         } else {
-            /* DUAL PATH: full MR+BPSW on every number, per-number SHA-256 */
-            for (uint64_t n = seg_lo; n <= check_hi; n += 2) {
+            /* DUAL PATH: full MR+BPSW on every number */
+            for (uint64_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
 
@@ -1380,15 +1421,18 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
         pthread_create(&threads[i], NULL, verify_range_thread, &work[i]);
     }
 
+    /* Start input monitor thread for 'q' to stop */
+    start_input_monitor();
+
     /* Monitor loop: print progress + write checkpoints while threads run */
     {
         struct timespec last_cp, now;
         clock_gettime(CLOCK_MONOTONIC, &last_cp);
         int all_done = 0;
 
-        while (!all_done) {
-            /* Check every second */
-            struct timespec req = {0, 200000000}; /* 200ms */
+        while (!all_done && !stop_requested) {
+            /* Check every 200ms */
+            struct timespec req = {0, 200000000};
             nanosleep(&req, NULL);
 
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -1415,11 +1459,14 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
             double pct = 100.0 * total_v / (double)(total_even > 0 ? total_even : 1);
             fprintf(stderr, "\r  [%5.1f%%] %" PRIu64 " verified | %.0f/s | ETA: ",
                     pct, total_v, rate);
-            if (eta < 120) fprintf(stderr, "%.0fs    ", eta);
-            else if (eta < 7200) fprintf(stderr, "%.1fmin  ", eta / 60);
-            else if (eta < 172800) fprintf(stderr, "%.1fhrs  ", eta / 3600);
+            if (eta < 120) fprintf(stderr, "%.0fs ", eta);
+            else if (eta < 7200) fprintf(stderr, "%.1fmin ", eta / 60);
+            else if (eta < 172800) fprintf(stderr, "%.1fhrs ", eta / 3600);
             else fprintf(stderr, "%.1fdays ", eta / 86400);
+            fprintf(stderr, " [q to stop]  ");
             fflush(stderr);
+
+            check_for_stop();
 
             /* Checkpoint every CHECKPOINT_INTERVAL seconds */
             double since_cp = (now.tv_sec - last_cp.tv_sec) +
@@ -1431,6 +1478,9 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
         }
         fprintf(stderr, "\n");
     }
+
+    /* Stop input monitor */
+    stop_input_monitor();
 
     for (int i = 0; i < num_threads; i++)
         pthread_join(threads[i], NULL);
@@ -1492,7 +1542,10 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
     printf("  Max attempts:       %" PRIu64 " (at N=%" PRIu64 ")\n", g_max_att, g_max_att_n);
     printf("  SHA-256:            %s\n", master_hex);
 
-    if (counterexample) {
+    if (stop_requested) {
+        printf("\n  INTERRUPTED — partial run. Checkpoint saved (if enabled).\n");
+        printf("  Verified %" PRIu64 " even numbers before interruption.\n", total_verified);
+    } else if (counterexample) {
         printf("\n  *** COUNTEREXAMPLE: %" PRIu64 " ***\n", counterexample);
     } else {
         printf("\n  RESULT: Goldbach's Conjecture VERIFIED for entire range.\n");
@@ -1590,13 +1643,15 @@ static void run_beyond(int num_samples, const char *cert_file,
 
         int spr = num_samples / nranges;
         for (int i = 0; i < spr; i++) {
-            /* Generate random offset using two 32-bit randoms combined.
-             * drand48 gives 48 bits of randomness; for 128-bit ranges we
-             * combine two calls for a 64-bit random offset within range. */
-            uint64_t r1 = (uint64_t)(drand48() * 4294967296.0);  /* 32 bits */
-            uint64_t r2 = (uint64_t)(drand48() * 4294967296.0);  /* 32 bits */
-            uint64_t rand64 = (r1 << 32) | r2;
-            uint128_t offset = (uint128_t)rand64 % ranges[r].range;
+            /* Generate random offset across the full range.
+             * Combine four 32-bit randoms for a 128-bit value, then mod by range. */
+            uint64_t r1 = (uint64_t)(drand48() * 4294967296.0);
+            uint64_t r2 = (uint64_t)(drand48() * 4294967296.0);
+            uint64_t r3 = (uint64_t)(drand48() * 4294967296.0);
+            uint64_t r4 = (uint64_t)(drand48() * 4294967296.0);
+            uint128_t rand128 = ((uint128_t)((r1 << 32) | r2) << 64) |
+                                 (uint128_t)((r3 << 32) | r4);
+            uint128_t offset = rand128 % ranges[r].range;
             uint128_t n = ranges[r].lo + offset;
             if (n % 2) n++;
             if (n < 4) n = 4;
@@ -1874,18 +1929,27 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
 static void interactive_menu(void) {
     int cores = detect_cores();
 
-    printf("  Select a mode:\n\n");
-    printf("    1. Quick Test          Verify up to 10^8       (~10 seconds)\n");
-    printf("    2. Standard Run        Verify up to 10^9       (~1 minute)\n");
-    printf("    3. Extended Run        Verify up to 10^10      (~15 minutes)\n");
-    printf("    4. Deep Run            Verify up to 10^11      (~2.5 hours)\n");
-    printf("    5. Beyond Record       Sample 100K numbers past 4×10^18\n");
-    printf("    6. Suspect Mode        Test 10K adversarial (hardest possible) numbers\n");
-    printf("    7. Custom Range        Specify your own range\n");
-    printf("    8. Self-Test Only      Validate all components\n");
+  while (1) {
+    stop_requested = 0;
+    fast_mode = 0;  /* reset between runs */
+
+    printf("\n  MODES:\n\n");
+    printf("    1. Extend the Record   Push past 4×10^18 (fast mode + checkpoint)\n");
+    printf("    2. Benchmark           Test your hardware speed\n");
+    printf("    3. Beyond Record       Sample random numbers past 4×10^18\n");
+    printf("    4. Suspect Mode        Test adversarial (hardest possible) numbers\n");
+    printf("    5. Custom Range        Specify your own range\n");
+    printf("    6. Self-Test Only      Validate all components\n");
     printf("    0. Exit\n");
-    printf("\n  Detected %d CPU cores. All modes use all available cores.\n", cores);
-    printf("\n  Choice [1-8, 0 to exit]: ");
+    printf("\n  SYSTEM:\n\n");
+    printf("    Detected %d CPU cores — all modes use all available cores.\n", cores);
+    printf("\n  For advanced options, run:  ./goldbach --help\n");
+    printf("  Key flags:\n");
+    printf("    --fast           Sieve-only (~39x faster), auto-escalates on failure\n");
+    printf("    --checkpoint F   Auto-save progress every 60s, resume on restart\n");
+    printf("    --range S E      Split ranges across machines (cluster mode)\n");
+    printf("    --cert F         Write per-number proof certificates\n");
+    printf("\n  Choice [1-6, 0 to exit]: ");
     fflush(stdout);
 
     int choice = 0;
@@ -1893,8 +1957,8 @@ static void interactive_menu(void) {
 
     printf("\n");
 
-    /* Run self-test first for all modes */
-    if (choice >= 1 && choice <= 6) {
+    /* Run self-test first for all computation modes */
+    if (choice >= 1 && choice <= 5) {
         printf("--- SELF-TEST (8 checks) ---\n");
         generate_base_primes(100000);
         int ok = run_self_tests();
@@ -1904,30 +1968,132 @@ static void interactive_menu(void) {
         num_base_primes = 0; num_small_primes = 0;
     }
 
-    /* Auto-enable checkpointing for runs > 10 minutes */
     switch (choice) {
-        case 1:
-            run_exhaustive_range(4, 100000000ULL, cores);
-            break;
-        case 2:
+        case 1: {
+            /* Extend the record — fast mode, checkpointed, starting from 4×10^18 */
+            printf("  Starting from the current record: 4×10^18\n");
+            printf("  Mode: fast (sieve-only, auto-escalates on failure)\n");
+            printf("  Checkpointing enabled — safe to interrupt and resume.\n\n");
+            fast_mode = 1;
             checkpoint_file = "goldbach_checkpoint.txt";
-            run_exhaustive_range(4, 1000000000ULL, cores);
+            run_exhaustive_range(4000000000000000000ULL, 5000000000000000000ULL, cores);
             break;
-        case 3:
-            checkpoint_file = "goldbach_checkpoint.txt";
-            run_exhaustive_range(4, 10000000000ULL, cores);
+        }
+        case 2: {
+            /* Benchmark submenu */
+            printf("  BENCHMARK — verify known ranges to measure your hardware.\n");
+            printf("  These ranges are already proven; this tests speed, not new territory.\n\n");
+            printf("    a. Quick     10^8    (~0.2s fast, ~7s dual)\n");
+            printf("    b. Standard  10^9    (~2s fast, ~1min dual)\n");
+            printf("    c. Extended  10^10   (~18s fast, ~13min dual)\n");
+            printf("    d. Deep      10^11   (~3min fast, ~2.5hrs dual)\n");
+            printf("    0. Back to menu\n");
+            printf("\n  Benchmark level (a/b/c/d, 0 to go back): ");
+            fflush(stdout);
+            char level = '0';
+            scanf(" %c", &level);
+            if (level == '0') continue;
+
+            printf("  Use fast mode? (y/n): ");
+            fflush(stdout);
+            char fast_yn = 'n';
+            scanf(" %c", &fast_yn);
+            if (fast_yn == 'y' || fast_yn == 'Y') fast_mode = 1;
+            printf("\n");
+
+            switch (level) {
+                case '0':
+                    continue;  /* back to menu loop */
+                case 'a': case 'A':
+                    run_exhaustive_range(4, 100000000ULL, cores); break;
+                case 'b': case 'B':
+                    run_exhaustive_range(4, 1000000000ULL, cores); break;
+                case 'c': case 'C':
+                    checkpoint_file = "goldbach_checkpoint.txt";
+                    run_exhaustive_range(4, 10000000000ULL, cores); break;
+                case 'd': case 'D':
+                    checkpoint_file = "goldbach_checkpoint.txt";
+                    run_exhaustive_range(4, 100000000000ULL, cores); break;
+                default:
+                    printf("Invalid level.\n");
+            }
             break;
-        case 4:
-            checkpoint_file = "goldbach_checkpoint.txt";
-            run_exhaustive_range(4, 100000000000ULL, cores);
+        }
+        case 3: {
+            printf("  BEYOND RECORD — sample random numbers past 4×10^18\n\n");
+            printf("    a. Default (100K samples)\n");
+            printf("    b. Custom amount\n");
+            printf("    0. Back to menu\n");
+            printf("\n  Choice: ");
+            fflush(stdout);
+            char bc = '0';
+            scanf(" %c", &bc);
+            if (bc == '0') continue;
+            int beyond_n = 100000;
+            if (bc == 'b' || bc == 'B') {
+                printf("  Number of samples: ");
+                fflush(stdout);
+                scanf("%d", &beyond_n);
+                if (beyond_n < 1) beyond_n = 1;
+            }
+            /* Range selection */
+            uint128_t b_lo = (uint128_t)4000000000000000000ULL;
+            uint128_t b_hi = MR_PROVEN_LIMIT;  /* 3.317×10^24 */
+            printf("\n  Include probabilistic range past 3.317×10^24? (y/n): ");
+            fflush(stdout);
+            char prob_yn = 'n';
+            scanf(" %c", &prob_yn);
+            if (prob_yn == 'y' || prob_yn == 'Y') {
+                /* Hard ceiling: uint128 arithmetic safe to ~10^38 */
+                b_hi = (uint128_t)1000000000000000000ULL *
+                       (uint128_t)1000000000000000000ULL * (uint128_t)100;
+                printf("  Range: 4×10^18 to 10^38 (proven + probabilistic)\n");
+            } else {
+                printf("  Range: 4×10^18 to 3.317×10^24 (proven only)\n");
+            }
+            printf("\n");
+            run_beyond(beyond_n, "goldbach_certificates.txt", b_lo, b_hi);
             break;
-        case 5:
-            run_beyond(100000, "goldbach_certificates.txt", 0, 0);
+        }
+        case 4: {
+            printf("  SUSPECT MODE — test adversarial (hardest possible) numbers\n\n");
+            printf("    a. Default (10K samples)\n");
+            printf("    b. Custom amount\n");
+            printf("    0. Back to menu\n");
+            printf("\n  Choice: ");
+            fflush(stdout);
+            char sc = '0';
+            scanf(" %c", &sc);
+            if (sc == '0') continue;
+            int suspect_n = 10000;
+            if (sc == 'b' || sc == 'B') {
+                printf("  Number of samples: ");
+                fflush(stdout);
+                scanf("%d", &suspect_n);
+                if (suspect_n < 1) suspect_n = 1;
+            }
+            /* Scale selection */
+            printf("\n  Include probabilistic range past 3.317×10^24? (y/n): ");
+            fflush(stdout);
+            char sp_yn = 'n';
+            scanf(" %c", &sp_yn);
+            uint128_t s_scale;
+            if (sp_yn == 'y' || sp_yn == 'Y') {
+                /* Sample across full range — use midpoint of log scale */
+                s_scale = (uint128_t)1000000000000000000ULL *
+                          (uint128_t)1000000000000ULL;  /* 10^30 */
+                printf("  Scale: ~10^30 (proven + probabilistic)\n");
+            } else {
+                /* Sample across proven range — use midpoint */
+                s_scale = (uint128_t)1000000000000000000ULL *
+                          (uint128_t)1000000;  /* 10^24 */
+                printf("  Scale: ~10^24 (proven only)\n");
+            }
+            printf("\n");
+            run_suspect(suspect_n, s_scale, NULL);
             break;
-        case 6:
-            run_suspect(10000, (uint128_t)4000000000000000000ULL, NULL);
-            break;
-        case 7: {
+        }
+        case 5: {
             uint64_t start, end;
             printf("  Enter range start (even, >= 4): ");
             fflush(stdout);
@@ -1938,11 +2104,17 @@ static void interactive_menu(void) {
             if (start < 4) start = 4;
             if (start % 2) start++;
             if (end % 2) end--;
+            printf("\n  Use fast mode? (y/n): ");
+            fflush(stdout);
+            char fast_yn = 'n';
+            scanf(" %c", &fast_yn);
+            if (fast_yn == 'y' || fast_yn == 'Y') fast_mode = 1;
             printf("\n");
+            checkpoint_file = "goldbach_checkpoint.txt";
             run_exhaustive_range(start, end, cores);
             break;
         }
-        case 8:
+        case 6:
             printf("--- SELF-TEST (8 checks) ---\n");
             generate_base_primes(100000);
             {
@@ -1952,10 +2124,27 @@ static void interactive_menu(void) {
             break;
         case 0:
             printf("Exiting.\n");
-            break;
+            return;
         default:
             printf("Invalid choice.\n");
     }
+
+    /* Return to menu after mode completes */
+    if (!stop_requested) {
+        printf("\nPress Enter to return to menu (or Ctrl+C to exit)...");
+        fflush(stdout);
+        /* Clear any leftover input */
+        int c; while ((c = getchar()) != '\n' && c != EOF);
+        getchar();  /* wait for Enter */
+    } else {
+        printf("\n\n  Interrupted.\n");
+        printf("Press Enter to return to menu...");
+        fflush(stdout);
+        int c; while ((c = getchar()) != '\n' && c != EOF);
+        getchar();
+    }
+
+  } /* end while(1) menu loop */
 }
 
 /* ============================================================================
@@ -2011,6 +2200,7 @@ int main(int argc, char **argv) {
 
     /* No arguments → interactive menu */
     if (argc == 1) {
+        signal(SIGINT, sigint_handler);
         interactive_menu();
         return 0;
     }
@@ -2097,6 +2287,9 @@ int main(int argc, char **argv) {
         printf("Tier 1: sieve-only (deterministic, ~39x faster than dual mode)\n");
         printf("Tier 2-3: auto-escalates to full dual MR+BPSW on any shortcut failure\n\n");
     }
+
+    /* Install signal handler for clean interruption */
+    signal(SIGINT, sigint_handler);
 
     /* Self-test always runs first */
     printf("--- SELF-TEST (8 checks) ---\n");
