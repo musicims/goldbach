@@ -1005,6 +1005,55 @@ static void *verify_range_thread(void *arg) {
 }
 
 /* ============================================================================
+ * TOP-10 TRACKER — for beyond and suspect modes
+ * ============================================================================ */
+
+static int sprint_u128(char *buf, size_t sz, uint128_t v);  /* forward decl */
+
+#define TOP_N 10
+
+typedef struct {
+    uint128_t values[TOP_N];
+    int count;
+} Top10;
+
+static void top10_init(Top10 *t) {
+    t->count = 0;
+    for (int i = 0; i < TOP_N; i++) t->values[i] = 0;
+}
+
+static void top10_insert(Top10 *t, uint128_t val) {
+    /* Quick reject: if full and val is smaller than smallest, skip */
+    if (t->count >= TOP_N && val <= t->values[TOP_N - 1]) return;
+
+    /* Find insertion point (descending order) */
+    int pos = t->count < TOP_N ? t->count : TOP_N - 1;
+    for (int i = 0; i < t->count && i < TOP_N; i++) {
+        if (val > t->values[i]) { pos = i; break; }
+    }
+
+    /* Shift down */
+    int end = t->count < TOP_N ? t->count : TOP_N - 1;
+    for (int i = end; i > pos; i--)
+        t->values[i] = t->values[i - 1];
+
+    t->values[pos] = val;
+    if (t->count < TOP_N) t->count++;
+}
+
+static void top10_print(const Top10 *t) {
+    if (t->count == 0) return;
+    printf("\n  Top %d largest numbers verified:\n", t->count);
+    for (int i = 0; i < t->count; i++) {
+        char buf[50];
+        sprint_u128(buf, sizeof(buf), t->values[i]);
+        int digits = (int)strlen(buf);
+        const char *mode = (t->values[i] < MR_PROVEN_LIMIT) ? "PROVEN" : "PROBABILISTIC";
+        printf("    %2d. %s  (%d digits, %s)\n", i + 1, buf, digits, mode);
+    }
+}
+
+/* ============================================================================
  * BEYOND MODE — with dual verification and certificates
  * ============================================================================ */
 
@@ -1634,6 +1683,8 @@ static void run_beyond(int num_samples, const char *cert_file,
     int g_max_att = 0;
     uint128_t g_max_n = 0;
     int total = 0, total_pass = 0;
+    Top10 top;
+    top10_init(&top);
 
     for (int r = 0; r < nranges; r++) {
         printf("Range: %s\n", ranges[r].label);
@@ -1657,6 +1708,7 @@ static void run_beyond(int num_samples, const char *cert_file,
             if (n < 4) n = 4;
 
             BeyondResult res = test_goldbach_single_wide(n);
+            if (res.dual_ok) top10_insert(&top, n);
             tatt += res.attempts;
             if (res.dual_ok) {
                 total_pass++;
@@ -1709,6 +1761,7 @@ static void run_beyond(int num_samples, const char *cert_file,
     }
     if (total_pass == total)
         printf("  All tested numbers satisfy Goldbach.\n");
+    top10_print(&top);
     printf("====================================================================\n");
 }
 
@@ -1791,6 +1844,8 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
     int start_idx = 0;
     int total = 0, total_pass = 0;
     long total_att = 0;
+    Top10 top;
+    top10_init(&top);
 
     /* Resume from checkpoint if available */
     if (checkpoint_file) {
@@ -1820,6 +1875,7 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
         uint128_t n = generate_suspect(scale, rand_base + (uint64_t)i);
 
         BeyondResult res = test_goldbach_single_wide(n);
+        if (res.dual_ok) top10_insert(&top, n);
         total_att += res.attempts;
         if (res.dual_ok) {
             total_pass++;
@@ -1911,6 +1967,7 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
                    "  Prime density makes the shortcut robust against adversarial inputs.\n",
                    avg_att / 25.0);
     }
+    top10_print(&top);
     printf("====================================================================\n");
 
     /* Clean up checkpoint on success */

@@ -6,7 +6,7 @@ Every result is checked by two independent primality tests (deterministic Miller
 
 Single C file. Zero dependencies. Runs anywhere with a C compiler.
 
-**Current status:** Tool complete. Verified exhaustively to 10^10, sampled to 10^24. No records have been set — the current world record (4 × 10^18, Oliveira e Silva 2012) stands. Scaling estimates in this document are projections.
+**Current status:** Tool complete. Verified exhaustively to 10^10, sampled to 10^38. No records have been set — the current world record (4 × 10^18, Oliveira e Silva 2012) stands. Scaling estimates in this document are projections.
 
 ---
 
@@ -30,89 +30,137 @@ gcc -O3 -march=native -pthread goldbach.c -o goldbach -lm
 
 ---
 
-## What It Does
+## Interactive Menu
 
-**Goldbach's Conjecture (1742):** Every even integer > 2 is the sum of two primes.
+Running `./goldbach` with no arguments presents an interactive menu:
 
-This tool verifies the conjecture by testing even numbers and producing **dual-verified, independently checkable proof certificates**. Every result is confirmed by two independent primality tests (Miller-Rabin + Baillie-PSW). If they ever disagree, the program halts.
+```
+MODES:
 
-The current world record for exhaustive verification is **4 x 10^18** (Oliveira e Silva, 2012). This tool is designed to extend that — though doing so requires significant distributed compute (see [Scaling Estimates](#scaling-estimates) below). On a single machine, it can verify billions of numbers per day and sample-test numbers up to 10^24+.
+  1. Extend the Record   Push past 4×10^18 (fast mode + checkpoint)
+  2. Benchmark           Test your hardware speed
+  3. Beyond Record       Sample random numbers past 4×10^18
+  4. Suspect Mode        Test adversarial (hardest possible) numbers
+  5. Custom Range        Specify your own range
+  6. Self-Test Only      Validate all components
+  0. Exit
+```
+
+All modes auto-detect CPU cores. Press `q` during any running test to stop and return to the menu. All modes run a self-test before starting.
 
 ---
 
 ## Modes
 
-### 1. Interactive Menu
+### 1. Extend the Record
 
+The primary mode. Starts exhaustive verification from the current world record (4×10^18), pushing forward with fast mode enabled and checkpointing on. Safe to interrupt and resume.
+
+**Interactive:** Menu option 1 — starts immediately.
+
+**CLI:**
 ```bash
-./goldbach
+./goldbach --range 4e18 5e18 --fast --checkpoint progress.txt
 ```
 
-Presents numbered options from quick test (~10 seconds) to deep run (~2.5 hours). Auto-detects your CPU cores.
+### 2. Benchmark
 
-### 2. Exhaustive Verification
+Test your hardware speed on already-proven ranges. Useful for estimating how long a real run would take before committing to server costs.
 
-Checks **every** even number in a range. Airtight — no gaps.
+**Interactive:** Menu option 2, then choose:
+- **a–d:** Range size (10^8 to 10^11)
+- **Fast or dual mode**
+- **0:** Back to menu
 
+**CLI:**
 ```bash
-./goldbach 1e9                          # Verify up to 1 billion (dual-verified)
-./goldbach 1e10 8                       # 10 billion, 8 threads
-./goldbach 1e12 --checkpoint progress.txt  # Long run with auto-save/resume
-./goldbach 1e10 --fast                  # ~3-40x faster, still provably correct
+./goldbach 1e9                    # Dual mode
+./goldbach 1e9 --fast             # Fast mode
+./goldbach 1e10 8 --fast          # Fast, 8 threads
 ```
 
-### 3. Cluster Mode
+### 3. Beyond Record
 
-Split ranges across multiple machines. Each node works independently — no communication needed.
+Sample random numbers past the world record. Each result is dual-verified. This is **sampling** — it tests specific random numbers, not every number in the range. Outputs the top 10 largest numbers verified.
+
+**Interactive:** Menu option 3, then choose:
+- **a:** Default 100K samples
+- **b:** Custom sample count
+- Then choose proven-only (up to 3.317×10^24) or include probabilistic range (up to 10^38)
+
+**CLI:**
+```bash
+./goldbach --beyond 100000                      # 100K, default zones past 4×10^18
+./goldbach --beyond 1000000 4e18 3.317e24       # 1M across full proven range
+./goldbach --beyond 50000 1e24 1e38             # 50K in probabilistic range
+./goldbach --beyond 10000 4e18 1e38 --cert c.txt  # With certificate file
+```
+
+**Verification boundaries (automatic, per-number):**
+
+| Range | Witnesses | Mode |
+|-------|-----------|------|
+| Below 3.317 × 10^24 | 12 MR (proven) + BPSW | PROVEN |
+| Above 3.317 × 10^24 | 24 MR (probabilistic, error < 10^-14) + BPSW | PROBABILISTIC |
+
+The engine auto-selects for each number. Output labels which mode was used and shows the top 10 largest numbers tested.
+
+### 4. Suspect Mode
+
+Test numbers specifically constructed via the Chinese Remainder Theorem to be maximally difficult for the shortcut. These are the worst-case inputs — if anything could break it, these would.
+
+**Interactive:** Menu option 4, then choose sample count and proven/probabilistic range.
+
+**CLI:**
+```bash
+./goldbach --suspect 10000                    # 10K adversarial near 10^24
+./goldbach --suspect 10000 1e30               # 10K adversarial near 10^30
+./goldbach --suspect 50000 --cert s.txt       # With certificates
+```
+
+**Finding:** Even optimal adversarial construction only achieves ~1.7-2x more attempts than random inputs. This ~2x ceiling is fundamental — prime density prevents any construction from making numbers significantly harder. See [GOLDBACH_RESEARCH.md](GOLDBACH_RESEARCH.md) for the full analysis.
+
+### 5. Custom Range
+
+Exhaustive verification of any range you specify.
+
+**Interactive:** Menu option 5 — enter start, end, and choose fast or dual mode.
+
+**CLI:**
+```bash
+./goldbach --range 1e15 2e15 --fast --checkpoint p.txt
+```
+
+**Limit:** Exhaustive `--range` handles up to ~1.84 × 10^19 (uint64, sieve-based).
+
+### 6. Cluster Mode
+
+Split ranges across multiple machines. Each node works independently — no inter-node communication needed.
 
 ```bash
 # Machine 1
-./goldbach --range 0 1e15 --checkpoint node1.txt
+./goldbach --range 4e18 4.25e18 --fast --checkpoint node1.txt
 
 # Machine 2
-./goldbach --range 1e15 2e15 --checkpoint node2.txt
+./goldbach --range 4.25e18 4.5e18 --fast --checkpoint node2.txt
 
 # Machine 3
-./goldbach --range 2e15 3e15 --checkpoint node3.txt
+./goldbach --range 4.5e18 4.75e18 --fast --checkpoint node3.txt
 ```
 
-Each node outputs a SHA-256 hash. Combine to verify full coverage.
+Each node outputs a SHA-256 hash. The hash is thread-count-independent — same range always produces the same hash. It proves the run completed with the stated parameters. For per-number proof, use `--cert` + `--verify`.
 
-### 4. Beyond-Record Sampling
+### 7. Verify Certificates
 
-Test random numbers past the 4 x 10^18 world record. Each result is a dual-verified proof certificate. This is **sampling**, not exhaustive verification — it tests specific numbers but does not check every number in the range.
-
-```bash
-./goldbach --beyond 100000                     # 100K from default zones (4-10 x 10^18)
-./goldbach --beyond 1000000 4e18 5e18          # 1M in [4x10^18, 5x10^18]
-./goldbach --beyond 10000 1e20 1e21            # 10K in [10^20, 10^21]
-./goldbach --beyond 1000 1e23 1e24 --cert c.txt  # 1K near 10^24 with certificates
-```
-
-**Limits:** Exhaustive `--range` handles up to ~1.84 x 10^19 (uint64, sieve-based). Sampling `--beyond` uses 128-bit arithmetic — results are proven correct to 3.317 x 10^24 (deterministic Miller-Rabin boundary). Past that, the engine automatically switches to 24 MR witnesses + BPSW, where results are probabilistic with error < 10^-14 per test. The output clearly labels which mode was used.
-
-### 5. Adversarial (Suspect) Mode
-
-Test numbers specifically constructed to be maximally difficult.
-
-```bash
-./goldbach --suspect 10000                    # 10K adversarial numbers near 10^18
-./goldbach --suspect 10000 1e24               # 10K near 10^24
-./goldbach --suspect 50000 --cert s.txt       # With certificates
-./goldbach --suspect 100000 --checkpoint p.txt  # With checkpoint/resume
-```
-
-### 6. Verify Certificates
-
-Independently check a certificate file. Uses dual primality on every entry.
+Independently check a certificate file produced by `--cert`. Dual-checks every entry.
 
 ```bash
 ./goldbach --verify certificates.txt
 ```
 
-### 7. Self-Test
+### 8. Self-Test
 
-Runs 8 validation checks and refuses to proceed if any fail.
+Runs 8 validation checks (both primality tests, sieve consistency, modular arithmetic, brute-force cross-check, large-number Goldbach). Refuses to proceed if any fail.
 
 ```bash
 ./goldbach --selftest
@@ -126,64 +174,23 @@ For a deep dive into the math, development history, and benchmarks, see [GOLDBAC
 
 ### The Shortcut
 
-Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. This is a well-known consequence of the prime number theorem — each N-p has roughly a 1/ln(N) chance of being prime, so O(log N) attempts usually suffice. The technique is not new (Oliveira e Silva's record-setting work used the same approach); what's new here is the engineering: dual-verified primality, certificate output, cluster distribution, and checkpoint/resume.
-
-We measured the scaling empirically across 20 orders of magnitude: at most ~300-400 primality tests per number even past 10^18. Each test costs O(log² N) to O(log³ N), making the total per-number cost O(log³ N) — dramatically better than brute force's O(N / ln N), but not as cheap as "O(log N)" without qualification.
-
-### Dual Verification
-
-Two independent primality tests check every result:
-
-| Method | Basis | Status |
-|--------|-------|--------|
-| Miller-Rabin | Modular exponentiation | Proven correct below 3.317 x 10^24 (12 witnesses) |
-| Baillie-PSW | Lucas sequences | No known counterexample in 45 years |
-
-If they **ever disagree**, the program halts immediately.
-
-**Past 3.317 x 10^24**, the engine automatically switches to 24 MR witnesses. Each witness independently has at most a 1/4 chance of missing a composite, so 24 witnesses give error probability < (1/4)^24 ~ 3 x 10^-15. Combined with BPSW (which uses entirely different math), both would have to fail on the same number — no such number has ever been found. Results in this range are labeled `PROBABILISTIC` in the output to distinguish them from the `PROVEN` results below the boundary.
+Instead of searching all primes up to N/2, we try small primes p = 2, 3, 5, 7, 11... and check if N-p is prime. This is a well-known consequence of the prime number theorem — each N-p has roughly a 1/ln(N) chance of being prime, so O(log N) attempts usually suffice. The technique is not new (Oliveira e Silva's record-setting work used the same approach); what's new here is the engineering.
 
 ### Fast Mode (`--fast`)
 
-By default, every number is checked by both Miller-Rabin and BPSW (dual verification). The `--fast` flag uses **sieve-only** for routine primality checks — the Sieve of Eratosthenes is deterministic and exact, not probabilistic. No Miller-Rabin or BPSW runs on routine numbers in fast mode.
-
-The key: if the shortcut ever fails to find a pair (which has never happened), the engine automatically escalates to full dual MR+BPSW brute-force verification on that specific number. So the only numbers that matter (potential counterexamples) always get the full treatment.
-
-| Mode | Method | Speed | Credibility |
-|------|--------|-------|-------------|
-| Default (dual) | Sieve + MR + BPSW on every number | ~7M/sec (4 cores) | Two independent methods agree |
-| Fast | Sieve-only; full dual MR+BPSW on any failure | ~276M/sec (4 cores) | Deterministic sieve; auto-escalates |
-
-For context: Oliveira e Silva's record (4 × 10^18) was set using sieve-only verification — no Miller-Rabin, no BPSW, no dual check. Fast mode uses the same fundamental approach (sieve-only for routine checks) with the addition of automatic dual escalation on any failure.
-
-The SHA-256 hash is computed from the run summary (range, count, max attempts) and is thread-count-independent. The same range produces the same hash regardless of how many threads were used. Per-certificate integrity checking is available separately via `--cert` + `--verify`.
-
-### Adversarial Testing (`--suspect`)
-
-The engine can generate numbers specifically constructed to be as hard as possible for the Goldbach shortcut. Using the Chinese Remainder Theorem with an optimally chosen residue class (N ≡ 5738 mod 30030, the primorial of 2×3×5×7×11×13), each number is built so that N-p shares a factor with the primorial for 233 out of 300 small primes — guaranteeing N-p is composite for most initial attempts.
-
-The result: even these worst-case numbers only require ~1.7-2x more attempts than random inputs, across all scales tested from 10^18 to 10^24. Increasing the number of CRT conditions doesn't help — the primorial modulus grows faster than the benefit, and surviving primes remain dense enough to provide pairs quickly. This ~2x ceiling appears to be fundamental rather than an engineering limitation.
-
-This means the shortcut is robust against worst-case inputs, not just favorable ones. Exhaustive `--range` verification (testing every number sequentially) remains the strongest form of evidence, but `--suspect` demonstrates that targeted attacks on the algorithm don't work.
+Uses **sieve-only** for routine primality checks — deterministic and exact. ~39x faster than dual mode. If the shortcut ever fails, auto-escalates to full dual MR+BPSW. Oliveira e Silva's record used sieve-only; fast mode is the same approach with automatic escalation.
 
 ### Three-Tier Counterexample Detection
 
 | Tier | What Happens |
 |------|-------------|
-| Shortcut finds a pair | Normal. Dual-verified, hashed, done. This happens for every number tested so far. |
-| Shortcut exhausted (2,048 small primes tried) | Automatic full brute-force search with dual verification. This has **never triggered** across all testing — included as a safety net. If it ever does, the pair is logged and the run continues. |
-| Brute-force finds nothing (every prime up to N/2 checked) | **Goldbach counterexample.** Program halts with explicit warning. Every candidate was dual-checked. This would disprove the conjecture. |
+| Shortcut finds a pair | Normal. Verified, done. |
+| Shortcut exhausted (2,048 primes tried) | Auto brute-force with full dual MR+BPSW. Never triggered. |
+| Brute-force finds nothing | **Goldbach counterexample.** Halts. Every prime was dual-checked. |
 
 ### Checkpointing
 
-```bash
-./goldbach 1e12 --checkpoint progress.txt
-```
-
-- Auto-saves every 60 seconds (atomic write — never corrupted)
-- Resume by re-running the same command
-- Deleted automatically on successful completion
-- Overhead: ~3 seconds per 3 weeks of runtime
+`--checkpoint FILE` auto-saves every 60 seconds. Resume by re-running the same command. Deleted on successful completion. Overhead: ~3 seconds per 3 weeks.
 
 ---
 
@@ -197,17 +204,7 @@ Tested on a 4-core machine:
 | 10^9 | 500M | 78 seconds | 1.8 seconds |
 | 10^10 | 5B | ~13 minutes | ~18 seconds |
 
-Scales linearly with cores. A 48-core server is ~12x faster.
-
----
-
-## Scaling Estimates
-
-The current record (4 x 10^18) has stood since 2012. Goldbach verification is embarrassingly parallel — each number is independent — so it distributes across commodity hardware with no inter-node communication.
-
-Scaling estimates use benchmarked rate of ~276M/sec on 4 cores (fast mode), scaled linearly by core count. Actual throughput on 48-core EPYC hardware may differ — benchmark on your hardware with `./goldbach 1e9 --fast` before planning large runs.
-
-Fast mode uses proven-deterministic Miller-Rabin with automatic escalation to dual verification on any shortcut failure — strictly more rigorous than the methodology used for the existing record.
+Scales linearly with cores. Benchmark on your hardware with `./goldbach 1e9 --fast` before planning large runs.
 
 ---
 
@@ -215,7 +212,7 @@ Fast mode uses proven-deterministic Miller-Rabin with automatic escalation to du
 
 | File | Description |
 |------|-------------|
-| `goldbach.c` | The entire engine — 1,425 lines, zero dependencies |
+| `goldbach.c` | The entire engine — single file, zero dependencies |
 | `build.sh` | Auto-detect compiler + CPU, build with optimal flags |
 | `GOLDBACH_RESEARCH.md` | Full research notes, benchmarks, bug history, math references |
 | `goldbach_fft.py` | NTT convolution approach (research prototype) |

@@ -4,7 +4,7 @@
 
 A well-engineered implementation of known techniques for Goldbach verification — segmented sieve, small-prime shortcut (a well-known consequence of prime density), dual-verified primality testing, and certificate generation. The goal is a production-quality tool that could be used to extend the current exhaustive verification record.
 
-**Status:** Tool complete. No records set yet — verified exhaustively to 10^10, sampled to 10^24. Scaling estimates are projections.
+**Status:** Tool complete. No records set yet — verified exhaustively to 10^10, sampled to 10^38. Scaling estimates are projections.
 **Repository:** https://github.com/musicims/goldbach
 
 ---
@@ -279,7 +279,7 @@ Tier 3 has never triggered. If it ever does, the result is airtight — every ca
 
 The `--suspect` mode constructs numbers designed to be as difficult as possible for the small-prime shortcut. Each number N is chosen so that N ≡ 5738 mod 30030 (the primorial 2×3×5×7×11×13), an optimally selected residue class found by exhaustive search over all 15,015 even residue classes. This construction guarantees that N-p shares a factor with the primorial for 233 out of the first 300 small primes — meaning N-p is provably composite for those primes, forcing the shortcut to search further.
 
-**Empirical result:** Even these maximally adversarial numbers only require ~1.7-2.1x more attempts than random inputs, across all scales tested (10^18 to 10^24). 5,000 adversarial numbers at 10^18 scale: all pass, average 43 attempts vs ~25 for random. 1,000 adversarial numbers at 10^24: all pass, average 52 attempts.
+**Empirical result:** Even these maximally adversarial numbers only require ~1.7-2.1x more attempts than random inputs, across all scales tested (10^18 to 10^38). 5,000 adversarial numbers at 10^18 scale: all pass, average 43 attempts vs ~25 for random. 1,000 adversarial numbers at 10^24: all pass, average 52 attempts. Both beyond and suspect modes now sample uniformly across their full range (up to 10^38 when probabilistic mode is opted in) and display the top 10 largest numbers verified with proven/probabilistic labels.
 
 **Why this ceiling exists (empirically):** We tested the optimal CRT construction — the one that eliminates the most small primes (233 out of 300) — and it only doubled the difficulty. Increasing the number of CRT conditions doesn't help because the primorial modulus grows faster than the benefit. At some point, the surviving primes (those not eliminated by the construction) are still dense enough to provide Goldbach pairs quickly. The data shows this holds at every scale tested. The theoretical explanation involves prime density (the Prime Number Theorem), but the independence assumptions required to formalize it are exactly the ones that make Goldbach hard to prove — so we rely on the empirical evidence rather than the heuristic argument.
 
@@ -557,7 +557,7 @@ If referencing this work:
 ```
 Goldbach Verification Engine v2.0
 Dual-verified (Miller-Rabin + BPSW) with SHA-256 certificates
-Tested up to 10^10 exhaustively, sampled to 10^23
+Tested up to 10^10 exhaustively, sampled to 10^38
 https://github.com/musicims/goldbach
 ```
 
