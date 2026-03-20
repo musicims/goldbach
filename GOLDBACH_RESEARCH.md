@@ -523,9 +523,9 @@ The beyond and suspect modes have produced dual-verified Goldbach certificates a
 
 **What this means:** While individual large numbers have undoubtedly been tested informally, no previous work has published *dual-verified Goldbach certificates with independent primality cross-checking and SHA-256 integrity hashing* at these scales. The proven results (below 3.317 × 10^24) are mathematically airtight. The probabilistic results (above that) use 24 independent Miller-Rabin witnesses plus BPSW, giving a combined error probability below 10^-14 per number.
 
-In a run of 75,000 adversarial samples across the full range with logarithmic scale distribution, 23,174 (31%) landed in the proven zone and 51,826 (69%) in the probabilistic zone. All passed. The highest verified number was a 38-digit adversarial construction near 10^38 — the square root of the number of atoms in the observable universe.
+In adversarial testing across the full range with logarithmic scale distribution, roughly 31% of samples land in the proven zone (below 3.317 × 10^24) and 69% in the probabilistic zone. All pass. The highest verified numbers are 38-digit adversarial CRT constructions near 10^38 — numbers approaching the square root of the number of atoms in the observable universe.
 
-These are not exhaustive results and do not constitute a record extension. They are sampled verification certificates demonstrating that the conjecture holds at scales never previously tested, using both random and worst-case inputs.
+These are sampled results, not exhaustive. They do not extend the sequential verification record. What they demonstrate is that the conjecture holds at scales never previously tested with dual-verified certificates, using both random and worst-case adversarial inputs, up to the computational ceiling of 128-bit arithmetic.
 
 ---
 
@@ -559,15 +559,17 @@ The `--verify` flag does exactly this using dual primality (MR + BPSW), but any 
 
 ## Known Limitations
 
-- **No records set.** Exhaustive verification has been run to 10^10 on the development machine. The scaling estimates for larger ranges and cluster deployments are projections based on benchmarked throughput. No verification past 4 × 10^18 (the existing record) has been performed.
-- **No third-party reproduction.** All results so far come from a single implementation on a single machine. Independent reproduction — someone else compiling the code, running it, and confirming SHA-256 hashes match — has not yet occurred. The hashes below are published to enable this:
+- **No exhaustive record set.** The sequential verification record (4 × 10^18, Oliveira e Silva 2012) has not been extended. Exhaustive verification on the development machine has been run to 10^10. Sampled verification with dual-verified certificates has been performed up to 10^38 — but sampling does not constitute exhaustive coverage.
+- **No third-party reproduction.** All results so far come from a single implementation. Independent reproduction — someone else compiling the code, running it, and confirming SHA-256 hashes match — has not yet occurred. The hashes below are published to enable this:
 
-| Range | SHA-256 |
+| Range | SHA-256 (summary-based, thread-count-independent) |
 |-------|---------|
+| 4 to 10^7 | `144e0e16cb4a26822720deefad0c8baaa0d717b192c6e51f6e30197758a848b4` |
 | 4 to 10^8 | `f844ac14048521df924728b71af778774627bc6059e79c34e38e8f18ef63116e` |
 | 4 to 10^9 | `5ef51e847dcce5c71a777c8959ce76cf04ef9bed083ef4bebc8c06f97eedfda3` |
+| 4 to 10^10 | `2597dbdad5f0c5af4ad30b3499c7b64abad82a168a155189fa20227c6b506da4` |
 
-These hashes are computed from the run summary (range, verified count, max attempts, counterexample) and are identical regardless of thread count or whether `--fast` was used. If you run the engine on the same range and get the same hash, that constitutes independent verification. If you get a different hash, something is wrong — file an issue.
+These hashes are identical regardless of thread count or whether `--fast` was used. If you run the engine on the same range and get the same hash, that constitutes independent verification. If you get a different hash, something is wrong — file an issue.
 
 ---
 
