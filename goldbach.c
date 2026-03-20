@@ -96,19 +96,17 @@ static inline uint64_t powmod(uint64_t base, uint64_t exp, uint64_t mod) {
 }
 
 /* ============================================================================
- * WIDE ARITHMETIC (for numbers up to 10^24 — used by beyond mode)
+ * WIDE ARITHMETIC (for numbers up to ~1.7×10^38 — used by beyond/suspect modes)
  * ============================================================================
  *
  * For numbers > 2^64 (~1.84×10^19), we need 128-bit N.
  * mulmod128 uses binary multiplication to avoid needing 256-bit intermediates.
- * Numbers up to ~3.3×10^24 (~2^82) are safe: addition of two 82-bit values
- * fits in 128 bits, so addmod128 is overflow-safe.
+ * Safe for m < 2^127 (~1.7×10^38): a+b where both < m fits in uint128.
  */
 
 static inline uint128_t addmod128(uint128_t a, uint128_t b, uint128_t m) {
     a %= m; b %= m;
-    /* a + b could overflow uint128 if both near 2^128, but since
-     * m < 2^82 (max 3.3×10^24), a and b are < 2^82, sum < 2^83. Safe. */
+    /* Safe for m < 2^127 (~1.7×10^38): a,b < m, so a+b < 2*m < 2^128. */
     uint128_t r = a + b;
     if (r >= m) r -= m;
     return r;
@@ -117,7 +115,7 @@ static inline uint128_t addmod128(uint128_t a, uint128_t b, uint128_t m) {
 static inline uint128_t mulmod128(uint128_t a, uint128_t b, uint128_t m) {
     /* Binary (Russian peasant) multiplication mod m.
      * Avoids 256-bit intermediates by reducing at each step.
-     * For m < 2^83, each addmod128 is safe. */
+     * Safe for m < 2^127 (~1.7×10^38). */
     uint128_t result = 0;
     a %= m;
     while (b > 0) {
@@ -951,7 +949,7 @@ static void estimate_memory(uint128_t range_end, uint64_t *sieve_mem, uint64_t *
     double ln_n = log((double)sieve_limit);
     uint64_t est_primes = (uint64_t)((double)sieve_limit / (ln_n > 1 ? ln_n : 1));
     /* base_primes stored as uint32_t (up to 4.3×10^9) or uint64_t beyond */
-    uint64_t prime_size = (sieve_limit > 4000000000ULL) ? 8 : 4;
+    uint64_t prime_size = 4;  /* base_primes stored as uint32_t */
     *primes_mem = est_primes * prime_size;
 }
 
@@ -1055,10 +1053,15 @@ static void restore_terminal(void) {
     }
 }
 
+static int atexit_registered = 0;
+
 static void start_input_monitor(void) {
     system("stty raw -echo");
     stty_raw_active = 1;
-    atexit(restore_terminal);
+    if (!atexit_registered) {
+        atexit(restore_terminal);
+        atexit_registered = 1;
+    }
 }
 
 static void stop_input_monitor(void) {
@@ -1567,7 +1570,7 @@ static int run_self_tests(void) {
     printf("Running self-test suite...\n");
 
     /* Test 1: Miller-Rabin on known primes */
-    printf("  [1/8] Miller-Rabin known primes...");
+    printf("  [1/9] Miller-Rabin known primes...");
     {
         static const uint64_t kp[] = {2,3,5,7,11,13,997,7919,104729,
             999999937ULL, 999999999999999877ULL, 9999999999999999961ULL};
@@ -1578,7 +1581,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 2: BPSW on known primes */
-    printf("  [2/8] BPSW known primes...");
+    printf("  [2/9] BPSW known primes...");
     {
         static const uint64_t kp[] = {2,3,5,7,11,13,997,7919,104729,
             999999937ULL, 999999999999999877ULL, 9999999999999999961ULL};
@@ -1589,7 +1592,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 3: Both agree on known composites */
-    printf("  [3/8] Composites (both methods)...");
+    printf("  [3/9] Composites (both methods)...");
     {
         static const uint64_t kc[] = {0,1,4,6,8,9,15,100,561,1105,
             1000000007ULL * 1000000009ULL};
@@ -1603,7 +1606,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 4: Dual agreement on range 2-100000 */
-    printf("  [4/8] Dual agreement (2 to 100000)...");
+    printf("  [4/9] Dual agreement (2 to 100000)...");
     {
         int disagreements = 0;
         for (uint64_t n = 2; n <= 100000; n++) {
@@ -1617,7 +1620,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 5: Sieve vs dual primality */
-    printf("  [5/8] Sieve vs dual primality...");
+    printf("  [5/9] Sieve vs dual primality...");
     {
         uint8_t *sieve_buf = (uint8_t *)calloc(100000 / 16 + 100, 1);
         SegmentedSieve seg; seg.bits = sieve_buf; seg.lo = 3; seg.hi = 100000;
@@ -1633,7 +1636,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 6: Goldbach brute-force cross-check */
-    printf("  [6/8] Goldbach brute-force (4 to 10000)...");
+    printf("  [6/9] Goldbach brute-force (4 to 10000)...");
     {
         uint8_t *sieve_buf = (uint8_t *)calloc(100000 / 16 + 100, 1);
         SegmentedSieve seg; seg.bits = sieve_buf; seg.lo = 2; seg.hi = 10000;
@@ -1655,7 +1658,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 7: Modular arithmetic */
-    printf("  [7/8] Modular arithmetic...");
+    printf("  [7/9] Modular arithmetic...");
     {
         uint64_t r1 = powmod(2, 10, 1000);
         uint64_t r2 = powmod(3, 100, 1000000007ULL);
@@ -1664,7 +1667,7 @@ static int run_self_tests(void) {
     }
 
     /* Test 8: Large-number dual Goldbach */
-    printf("  [8/8] Large-number dual Goldbach...");
+    printf("  [8/9] Large-number dual Goldbach...");
     {
         static const uint64_t tv[] = {
             4000000000000000002ULL, 4000000000000000004ULL,
@@ -1676,6 +1679,19 @@ static int run_self_tests(void) {
             if (r.p + r.q != tv[i]) { printf(" FAIL: sum mismatch\n"); ok = 0; break; }
         }
         if (ok) printf(" OK\n"); else pass = 0;
+    }
+
+    /* Test 9: SHA-256 against known test vector */
+    printf("  [9/9] SHA-256 test vector...");
+    {
+        SHA256 ctx;
+        sha256_init(&ctx);
+        sha256_update(&ctx, "abc", 3);
+        char hex[65];
+        sha256_final(&ctx, hex);
+        if (strcmp(hex, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") == 0)
+            printf(" OK\n");
+        else { printf(" FAIL (got %s)\n", hex); pass = 0; }
     }
 
     return pass;
@@ -1832,6 +1848,15 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
 
     uint64_t sieve_limit = (uint64_t)sqrt((double)range_end) + 100;
     if (sieve_limit < 100000) sieve_limit = 100000;
+
+    /* Block ranges where base primes exceed uint32 storage */
+    if (sieve_limit > UINT32_MAX) {
+        printf("\n  ERROR: Range too large for exhaustive mode.\n");
+        printf("  sqrt(range_end) = %" PRIu64 " exceeds uint32 prime storage (max ~4.29×10^9).\n", sieve_limit);
+        printf("  Maximum exhaustive range: ~1.84×10^19\n");
+        printf("  For larger numbers, use --beyond or --suspect (no sieve needed).\n\n");
+        return;
+    }
 
     /* Check if we have enough memory (skip if --cache forced) */
     int mem_result = (using_mmap_primes == 2) ? 2 : check_memory(range_end, 1);
@@ -2452,7 +2477,7 @@ static void run_suspect(int num_samples, uint128_t scale_lo, uint128_t scale_hi,
     sprint_u128(max_n_buf, sizeof(max_n_buf), g_max_n);
 
     free(tids);
-    free(sw);
+    /* sw freed after result output (need proven/prob counts) */
 
     if (cf) {
         fprintf(cf, "# SHA-256: %s\n", hex);
@@ -2498,6 +2523,7 @@ static void run_suspect(int num_samples, uint128_t scale_lo, uint128_t scale_hi,
     printf("====================================================================\n");
 
     /* cert writes already flushed to disk by threads */
+    free(sw);
 
     /* Clean up checkpoint on success */
     if (checkpoint_file) {
@@ -2545,7 +2571,12 @@ static void interactive_menu(void) {
 
     /* Run self-test first for all computation modes */
     if (choice >= 1 && choice <= 5) {
-        printf("--- SELF-TEST (8 checks) ---\n");
+        /* Free previous base_primes to avoid leak on repeated menu runs */
+        if (using_mmap_primes) cleanup_mmap();
+        else if (base_primes) { free(base_primes); base_primes = NULL; }
+        num_base_primes = 0; num_small_primes = 0;
+
+        printf("--- SELF-TEST (9 checks) ---\n");
         generate_base_primes(100000);
         int ok = run_self_tests();
         printf("\nSelf-test: %s\n\n", ok ? "ALL PASSED" : "FAILED");
@@ -2674,7 +2705,7 @@ static void interactive_menu(void) {
                 printf("  Range: 4×10^18 to 3.317×10^24 (proven only)\n");
             }
             printf("\n");
-            run_suspect(suspect_n, s_lo, s_hi, NULL);
+            run_suspect(suspect_n, s_lo, s_hi, "goldbach_suspect_certs.txt");
             break;
         }
         case 5: {
@@ -2699,7 +2730,7 @@ static void interactive_menu(void) {
             break;
         }
         case 6:
-            printf("--- SELF-TEST (8 checks) ---\n");
+            printf("--- SELF-TEST (9 checks) ---\n");
             generate_base_primes(100000);
             {
                 int ok = run_self_tests();
@@ -2831,7 +2862,12 @@ int main(int argc, char **argv) {
                 i++;
             }
             if (i+1 < argc && argv[i+1][0] != '-') {
-                suspect_scale = (uint128_t)strtod(argv[i+1], NULL);
+                double sv = strtod(argv[i+1], NULL);
+                if (sv > 1e37) {
+                    fprintf(stderr, "Warning: suspect scale clamped to 10^37 (uint128 arithmetic limit)\n");
+                    sv = 1e37;
+                }
+                suspect_scale = (uint128_t)sv;
                 i++;
             }
         } else if (strcmp(argv[i], "--range") == 0) {
@@ -2879,7 +2915,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, sigint_handler);
 
     /* Self-test always runs first */
-    printf("--- SELF-TEST (8 checks) ---\n");
+    printf("--- SELF-TEST (9 checks) ---\n");
     generate_base_primes(100000);
     int ok = run_self_tests();
     printf("\nSelf-test: %s\n\n", ok ? "ALL PASSED" : "FAILED");
