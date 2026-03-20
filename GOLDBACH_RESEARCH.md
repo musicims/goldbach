@@ -497,7 +497,7 @@ The ~39x speedup comes from three changes in the fast path:
 **Known limitations of fast mode:**
 - SHA-256 hash is computed from the run summary (range, verified count, max attempts, counterexample), not per-number certificates. This makes hashes thread-count-independent and reproducible. Per-certificate integrity is available via `--cert` + `--verify`.
 - A resumed run's hash covers only the post-resume portion, so it won't match a clean full-range run. This is a known limitation of the checkpoint system.
-- Base prime generation allocates 1 byte per number up to sqrt(range_end). For range_end near 10^19, sqrt is ~4.3×10^9, requiring ~4GB. This may be an issue on memory-constrained machines.
+- Base prime generation uses a bit-packed sieve (1 bit per odd number) up to sqrt(range_end), plus the primes array. For range_end near 10^19, this requires ~700MB. For 10^20, ~3.8GB. For 10^21+, the engine warns and offers disk-cached generation via `--cache`.
 
 ---
 
@@ -521,7 +521,7 @@ The beyond and suspect modes have produced dual-verified Goldbach certificates a
 | 10^25 – 10^37 | 25–38 | None | Sampled (24 MR + BPSW) | PROBABILISTIC |
 | ~10^38 | 38 | None | Adversarial CRT numbers | PROBABILISTIC |
 
-**What this means:** No one has previously published Goldbach verification results — even sampled — for numbers with more than 19 digits. The proven results (below 3.317 × 10^24) are mathematically airtight. The probabilistic results (above that) use 24 independent Miller-Rabin witnesses plus BPSW, giving a combined error probability below 10^-14 per number.
+**What this means:** While individual large numbers have undoubtedly been tested informally, no previous work has published *dual-verified Goldbach certificates with independent primality cross-checking and SHA-256 integrity hashing* at these scales. The proven results (below 3.317 × 10^24) are mathematically airtight. The probabilistic results (above that) use 24 independent Miller-Rabin witnesses plus BPSW, giving a combined error probability below 10^-14 per number.
 
 In a run of 75,000 adversarial samples across the full range with logarithmic scale distribution, 23,174 (31%) landed in the proven zone and 51,826 (69%) in the probabilistic zone. All passed. The highest verified number was a 38-digit adversarial construction near 10^38 — the square root of the number of atoms in the observable universe.
 
