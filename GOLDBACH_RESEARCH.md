@@ -523,7 +523,7 @@ The beyond and suspect modes have produced dual-verified Goldbach certificates a
 
 **What this means:** While individual large numbers have undoubtedly been tested informally, no previous work has published *dual-verified Goldbach certificates with independent primality cross-checking and SHA-256 integrity hashing* at these scales. The proven results (below 3.317 × 10^24) are mathematically airtight. The probabilistic results (above that) use 24 independent Miller-Rabin witnesses plus BPSW, giving a combined error probability below 10^-14 per number.
 
-In adversarial testing across the full range with logarithmic scale distribution, roughly 31% of samples land in the proven zone (below 3.317 × 10^24) and 69% in the probabilistic zone. All pass. The highest verified numbers are 38-digit adversarial CRT constructions near 10^38 — numbers approaching the square root of the number of atoms in the observable universe.
+A published run of 1,000,000 adversarial samples across the full range with logarithmic scale distribution produced 305,592 proven results (30.6%) and 694,408 probabilistic results (69.4%). All passed. The largest verified number was a 38-digit adversarial CRT construction: `99996241950560983038614113636497587948` — approaching the square root of the number of atoms in the observable universe. The complete certificate file (61MB, 1M entries) is included in the repository.
 
 These are sampled results, not exhaustive. They do not extend the sequential verification record. What they demonstrate is that the conjecture holds at scales never previously tested with dual-verified certificates, using both random and worst-case adversarial inputs, up to the computational ceiling of 128-bit arithmetic.
 
