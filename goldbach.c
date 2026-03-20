@@ -41,6 +41,7 @@
 #include <inttypes.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/statvfs.h>
 #include <termios.h>
 #include <fcntl.h>
 
@@ -199,7 +200,7 @@ static int is_prime_miller_rabin(uint64_t n) {
 
 /* Jacobi symbol (a/n) — n must be positive odd */
 static int jacobi(int64_t a, uint64_t n) {
-    if (n <= 0 || n % 2 == 0) return 0;
+    if (n < 2 || n % 2 == 0) return 0;
     if (n == 1) return 1;
 
     int result = 1;
@@ -370,9 +371,8 @@ static const uint128_t MR_PROVEN_LIMIT =
     (uint128_t)1000;
 
 /* 12 witnesses: proven correct below 3.317×10^24 */
-static const uint64_t MR_WITNESSES_12[] = {
-    2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37
-};
+/* MR_WITNESSES_12 — same as MR_WITNESSES, shared reference */
+#define MR_WITNESSES_12 MR_WITNESSES
 
 /* 24 witnesses: first 24 primes. Probability of false positive: < (1/4)^24 ≈ 3×10^-15.
  * Combined with BPSW (independent method, zero known failures), the chance of
@@ -430,7 +430,7 @@ static int is_prime_mr_wide(uint128_t n) {
 
 /* Wide Jacobi symbol — works with uint128_t n */
 static int jacobi_wide(int64_t a, uint128_t n) {
-    if (n <= 0 || n % 2 == 0) return 0;
+    if (n < 2 || n % 2 == 0) return 0;
     if (n == 1) return 1;
     int result = 1;
     if (a < 0) { a = -a; if (n % 4 == 3) result = -result; }
@@ -496,12 +496,8 @@ static int strong_lucas_test_wide(uint128_t n, int64_t D, int64_t P, int64_t Q) 
         U = U2; V = V2;
 
         if ((d >> i) & 1) {
-            uint128_t PU = mulmod128(Pm, U, n);
-            uint128_t sum_u = addmod128(PU, V, n);
-            if (sum_u % 2 != 0) sum_u = addmod128(sum_u, n, n); /* make even */
-            /* Divide by 2: if sum_u is even, just shift. Since n is odd,
-             * inv2 = (n+1)/2 is the modular inverse of 2. */
             uint128_t inv2 = (n + 1) / 2;
+            uint128_t PU = mulmod128(Pm, U, n);
             uint128_t Un = mulmod128(addmod128(PU, V, n), inv2, n);
 
             uint128_t DU = mulmod128(Dm, U, n);
@@ -654,6 +650,200 @@ static inline int sieve_is_prime_bit(const uint8_t *sieve, uint64_t index) {
     return !(sieve[index >> 3] & (1u << (index & 7)));
 }
 
+/* ============================================================================
+ * DISK-CACHED BASE PRIME GENERATION (mmap)
+ * ============================================================================
+ *
+ * When RAM is insufficient for the full base prime sieve, generate primes
+ * in segments and write to a file. Then mmap the file so the OS pages
+ * primes from disk as needed, using available RAM as cache.
+ */
+#include <sys/mman.h>
+
+static int using_mmap_primes = 0;
+static void *mmap_addr = NULL;
+static size_t mmap_size = 0;
+
+static void generate_base_primes_cached(uint64_t limit, const char *cache_file) {
+    printf("Generating base primes to disk cache: %s\n", cache_file);
+    printf("  (segmented generation — low memory usage)\n");
+
+    /* Check if cache file already exists and covers our range */
+    FILE *f = fopen(cache_file, "rb");
+    if (f) {
+        uint64_t saved_limit = 0;
+        uint64_t saved_count = 0;
+        if (fread(&saved_limit, sizeof(uint64_t), 1, f) == 1 &&
+            fread(&saved_count, sizeof(uint64_t), 1, f) == 1 &&
+            saved_limit >= limit && saved_count > 0) {
+            fclose(f);
+            printf("  Cache valid (covers up to %" PRIu64 ", %" PRIu64 " primes)\n", saved_limit, saved_count);
+            goto load_cache;
+        }
+        fclose(f);
+    }
+
+    /* Generate primes in segments and write to file */
+    {
+        f = fopen(cache_file, "wb");
+        if (!f) { fprintf(stderr, "Cannot create cache file %s\n", cache_file); exit(1); }
+
+        /* Header: limit and prime count (count filled in later) */
+        uint64_t header[2] = {limit, 0};
+        fwrite(header, sizeof(uint64_t), 2, f);
+
+        /* Write 2 as first prime */
+        uint32_t two = 2;
+        fwrite(&two, sizeof(uint32_t), 1, f);
+        uint64_t prime_count = 1;
+
+        /* We need "seed" primes up to sqrt(limit) to sieve segments */
+        uint64_t seed_limit = (uint64_t)sqrt((double)limit) + 100;
+        uint64_t seed_sieve_size = (seed_limit / 2 + 7) / 8 + 1;
+        uint8_t *seed_sieve = (uint8_t *)calloc(seed_sieve_size, 1);
+        if (!seed_sieve) { fprintf(stderr, "Cannot allocate seed sieve\n"); exit(1); }
+
+        /* Sieve seed primes */
+        for (uint64_t i = 1; (2*i+1)*(2*i+1) <= seed_limit; i++) {
+            if (!(seed_sieve[i >> 3] & (1u << (i & 7)))) {
+                uint64_t p = 2*i+1;
+                for (uint64_t j = (p*p - 1)/2; j < seed_limit/2 + 1; j += p)
+                    seed_sieve[j >> 3] |= (1u << (j & 7));
+            }
+        }
+
+        /* Collect seed primes into array */
+        uint64_t seed_count = 0;
+        for (uint64_t i = 1; 2*i+1 <= seed_limit; i++)
+            if (!(seed_sieve[i >> 3] & (1u << (i & 7)))) seed_count++;
+        uint64_t *seed_primes = (uint64_t *)malloc(seed_count * sizeof(uint64_t));
+        uint64_t si = 0;
+        for (uint64_t i = 1; 2*i+1 <= seed_limit; i++)
+            if (!(seed_sieve[i >> 3] & (1u << (i & 7))))
+                seed_primes[si++] = 2*i+1;
+        free(seed_sieve);
+
+        /* Write seed primes (they're also base primes) */
+        for (uint64_t i = 0; i < seed_count; i++) {
+            uint32_t p32 = (uint32_t)seed_primes[i];
+            fwrite(&p32, sizeof(uint32_t), 1, f);
+            prime_count++;
+        }
+
+        /* Now sieve segments from seed_limit+1 to limit */
+        uint64_t seg_size = 4 * 1024 * 1024;  /* 4M numbers per segment = 256KB sieve */
+        uint64_t seg_sieve_bytes = (seg_size / 2 + 7) / 8 + 1;
+        uint8_t *seg_sieve = (uint8_t *)calloc(seg_sieve_bytes, 1);
+
+        for (uint64_t seg_lo = seed_limit + 1; seg_lo <= limit; seg_lo += seg_size) {
+            uint64_t seg_hi = seg_lo + seg_size - 1;
+            if (seg_hi > limit) seg_hi = limit;
+
+            uint64_t base_odd = (seg_lo % 2 == 0) ? seg_lo + 1 : seg_lo;
+            uint64_t num_odds = (seg_hi - base_odd) / 2 + 1;
+            memset(seg_sieve, 0, (num_odds + 7) / 8);
+
+            /* Cross off multiples of each seed prime */
+            for (uint64_t i = 0; i < seed_count; i++) {
+                uint64_t p = seed_primes[i];
+                uint64_t start;
+                if (p * p >= seg_lo) start = p * p;
+                else {
+                    start = ((seg_lo + p - 1) / p) * p;
+                    if (start % 2 == 0) start += p;
+                }
+                for (uint64_t j = start; j <= seg_hi; j += 2 * p) {
+                    if (j >= base_odd) {
+                        uint64_t idx = (j - base_odd) / 2;
+                        seg_sieve[idx >> 3] |= (1u << (idx & 7));
+                    }
+                }
+            }
+
+            /* Extract primes and write to file */
+            for (uint64_t i = 0; i < num_odds; i++) {
+                if (!(seg_sieve[i >> 3] & (1u << (i & 7)))) {
+                    uint32_t p32 = (uint32_t)(base_odd + 2 * i);
+                    fwrite(&p32, sizeof(uint32_t), 1, f);
+                    prime_count++;
+                }
+            }
+
+            /* Progress */
+            if ((seg_lo - seed_limit) % (seg_size * 100) == 0) {
+                fprintf(stderr, "\r  Generated primes up to %" PRIu64 " (%" PRIu64 " so far)",
+                        seg_hi, prime_count);
+                fflush(stderr);
+            }
+        }
+        fprintf(stderr, "\r  Generated %" PRIu64 " primes up to %" PRIu64 "          \n",
+                prime_count, limit);
+
+        free(seg_sieve);
+        free(seed_primes);
+
+        /* Update header with final count */
+        fseek(f, 0, SEEK_SET);
+        header[0] = limit;
+        header[1] = prime_count;
+        fwrite(header, sizeof(uint64_t), 2, f);
+
+        /* Check for write errors (disk full, etc.) */
+        if (ferror(f)) {
+            fclose(f);
+            remove(cache_file);
+            fprintf(stderr, "ERROR: Write failed — disk may be full. Cache file removed.\n");
+            exit(1);
+        }
+        fclose(f);
+    }
+
+load_cache:
+    /* mmap the cache file */
+    {
+        int fd = open(cache_file, O_RDONLY);
+        if (fd < 0) { fprintf(stderr, "Cannot open cache %s\n", cache_file); exit(1); }
+
+        /* Read header */
+        uint64_t header[2];
+        if (read(fd, header, sizeof(header)) != sizeof(header)) {
+            fprintf(stderr, "Cache file corrupt — delete goldbach_primes.bin and retry\n");
+            close(fd); exit(1);
+        }
+        uint64_t cached_count = header[1];
+
+        /* mmap the primes data (after the 16-byte header) */
+        mmap_size = cached_count * sizeof(uint32_t) + 16;
+        mmap_addr = mmap(NULL, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+
+        if (mmap_addr == MAP_FAILED) {
+            fprintf(stderr, "mmap failed\n"); exit(1);
+        }
+
+        /* Point base_primes at the data after the header */
+        base_primes = (uint32_t *)((uint8_t *)mmap_addr + 16);
+        num_base_primes = (int)cached_count;
+        using_mmap_primes = 1;
+
+        /* Fill small_primes from the cached data */
+        num_small_primes = 0;
+        for (int i = 0; i < num_base_primes && num_small_primes < MAX_SMALL_PRIMES; i++)
+            small_primes[num_small_primes++] = base_primes[i];
+
+        printf("  Loaded %" PRIu64 " primes via mmap (disk-backed)\n", cached_count);
+    }
+}
+
+static void cleanup_mmap(void) {
+    if (using_mmap_primes && mmap_addr && mmap_addr != MAP_FAILED) {
+        munmap(mmap_addr, mmap_size);
+        mmap_addr = NULL;
+        base_primes = NULL;
+        using_mmap_primes = 0;
+    }
+}
+
 static void generate_base_primes(uint64_t limit) {
     /* Bit-packed sieve: 1 bit per odd number. Memory = limit/16 bytes.
      * For limit = 4.3×10^9 (sqrt of 1.84×10^19): ~270MB instead of ~4.3GB. */
@@ -700,35 +890,139 @@ static void generate_base_primes(uint64_t limit) {
 
 typedef struct {
     uint8_t *bits;
-    uint64_t base;
-    uint64_t lo, hi;
+    uint128_t base;
+    uint128_t lo, hi;
     uint64_t size_bits;
 } SegmentedSieve;
 
 static void sieve_segment(SegmentedSieve *seg) {
-    uint64_t lo = seg->lo, hi = seg->hi;
-    uint64_t base_odd = (lo % 2 == 0) ? lo + 1 : lo;
+    uint128_t lo = seg->lo, hi = seg->hi;
+    uint128_t base_odd = (lo % 2 == 0) ? lo + 1 : lo;
     seg->base = base_odd;
-    seg->size_bits = (hi - base_odd) / 2 + 1;
+    seg->size_bits = (uint64_t)((hi - base_odd) / 2 + 1);
     memset(seg->bits, 0, (seg->size_bits + 7) / 8);
 
     for (int i = 1; i < num_base_primes; i++) {
-        uint64_t p = base_primes[i];
-        if ((uint64_t)p * p > hi) break;
-        uint64_t start;
+        uint128_t p = base_primes[i];
+        if (p * p > hi) break;
+        uint128_t start;
         if (p * p >= lo) start = p * p;
         else { start = ((lo + p - 1) / p) * p; if (start % 2 == 0) start += p; }
-        for (uint64_t j = start; j <= hi; j += 2 * p)
-            if (j >= base_odd) sieve_set_composite(seg->bits, (j - base_odd) >> 1);
+        for (uint128_t j = start; j <= hi; j += 2 * p)
+            if (j >= base_odd)
+                sieve_set_composite(seg->bits, (uint64_t)((j - base_odd) >> 1));
     }
 }
 
-static inline int seg_is_prime(const SegmentedSieve *seg, uint64_t n) {
+static inline int seg_is_prime(const SegmentedSieve *seg, uint128_t n) {
     if (n < 2) return 0;
     if (n == 2) return 1;
     if (n % 2 == 0) return 0;
     if (n < seg->base || n > seg->hi) return 0;
-    return sieve_is_prime_bit(seg->bits, (n - seg->base) >> 1);
+    return sieve_is_prime_bit(seg->bits, (uint64_t)((n - seg->base) >> 1));
+}
+
+/* ============================================================================
+ * MEMORY CHECK
+ * ============================================================================ */
+
+static uint64_t get_available_memory(void) {
+    /* Read from /proc/meminfo on Linux */
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;  /* unknown — skip check */
+    char line[256];
+    uint64_t avail_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %" SCNu64, &avail_kb) == 1) break;
+    }
+    fclose(f);
+    return avail_kb * 1024;  /* return bytes */
+}
+
+/* Estimate memory needed for base prime generation + storage */
+static void estimate_memory(uint128_t range_end, uint64_t *sieve_mem, uint64_t *primes_mem) {
+    uint64_t sieve_limit = (uint64_t)sqrt((double)range_end) + 100;
+    if (sieve_limit < 100000) sieve_limit = 100000;
+
+    /* Bit-packed sieve: 1 bit per odd number */
+    *sieve_mem = (sieve_limit / 2 + 7) / 8 + 1;
+
+    /* Estimated prime count via prime number theorem: π(n) ≈ n/ln(n) */
+    double ln_n = log((double)sieve_limit);
+    uint64_t est_primes = (uint64_t)((double)sieve_limit / (ln_n > 1 ? ln_n : 1));
+    /* base_primes stored as uint32_t (up to 4.3×10^9) or uint64_t beyond */
+    uint64_t prime_size = (sieve_limit > 4000000000ULL) ? 8 : 4;
+    *primes_mem = est_primes * prime_size;
+}
+
+/* Returns: 0 = proceed, 1 = user chose to abort, 2 = user chose disk cache */
+static int check_memory(uint128_t range_end, int interactive) {
+    uint64_t sieve_mem, primes_mem;
+    estimate_memory(range_end, &sieve_mem, &primes_mem);
+    uint64_t total_needed = sieve_mem + primes_mem;
+
+    uint64_t available = get_available_memory();
+    if (available == 0) return 0;  /* can't determine — proceed */
+
+    /* Leave 20% headroom for OS + threads */
+    uint64_t safe_limit = (uint64_t)(available * 0.8);
+
+    if (total_needed <= safe_limit) return 0;  /* fits fine */
+
+    double needed_gb = total_needed / (1024.0 * 1024.0 * 1024.0);
+    double avail_gb = available / (1024.0 * 1024.0 * 1024.0);
+    double sieve_gb = sieve_mem / (1024.0 * 1024.0 * 1024.0);
+    double primes_gb = primes_mem / (1024.0 * 1024.0 * 1024.0);
+
+    printf("\n  WARNING: Memory requirements exceed available RAM.\n\n");
+    printf("    Base prime sieve:  %.1f GB\n", sieve_gb);
+    printf("    Primes array:      %.1f GB\n", primes_gb);
+    printf("    Total needed:      %.1f GB\n", needed_gb);
+    printf("    Available (80%%):   %.1f GB\n", avail_gb * 0.8);
+    printf("\n");
+
+    if (!interactive) {
+        printf("  Use a smaller range, or run on a machine with more RAM.\n");
+        printf("  Proceeding anyway (may swap heavily or crash).\n\n");
+        return 0;
+    }
+
+    printf("  Options:\n");
+    printf("    a. Specify a smaller range\n");
+    printf("    b. Use disk-cached primes (slower, but fits in memory)\n");
+    printf("    c. Proceed anyway (may swap heavily or crash)\n");
+    printf("\n  Choice: ");
+    fflush(stdout);
+    char ch = 'a';
+    scanf(" %c", &ch);
+    printf("\n");
+
+    if (ch == 'a' || ch == 'A') return 1;  /* abort */
+    if (ch == 'b' || ch == 'B') {
+        /* Check disk space before committing to cache */
+        struct statvfs st;
+        uint64_t disk_avail = 0;
+        if (statvfs(".", &st) == 0)
+            disk_avail = (uint64_t)st.f_bavail * st.f_frsize;
+
+        /* Cache file size ≈ primes_mem (each prime stored as uint32) */
+        uint64_t cache_size = primes_mem;
+        /* Plus the temporary sieve during generation (much smaller, ~256KB segments) */
+
+        if (disk_avail > 0 && cache_size > disk_avail * 0.8) {
+            double cache_gb = cache_size / (1024.0 * 1024.0 * 1024.0);
+            double disk_gb = disk_avail / (1024.0 * 1024.0 * 1024.0);
+            printf("  WARNING: Disk cache would need %.1f GB but only %.1f GB available.\n",
+                   cache_gb, disk_gb);
+            printf("  Cannot use disk cache. Choose a smaller range or add more disk space.\n\n");
+            return 1;  /* abort */
+        }
+
+        double cache_gb = cache_size / (1024.0 * 1024.0 * 1024.0);
+        printf("  Disk cache will use ~%.1f GB.\n\n", cache_gb);
+        return 2;  /* disk cache */
+    }
+    return 0;  /* proceed */
 }
 
 /* ============================================================================
@@ -752,12 +1046,23 @@ static int kbhit(void) {
     return bytes > 0;
 }
 
+static int stty_raw_active = 0;
+
+static void restore_terminal(void) {
+    if (stty_raw_active) {
+        system("stty cooked echo");
+        stty_raw_active = 0;
+    }
+}
+
 static void start_input_monitor(void) {
     system("stty raw -echo");
+    stty_raw_active = 1;
+    atexit(restore_terminal);
 }
 
 static void stop_input_monitor(void) {
-    system("stty cooked echo");
+    restore_terminal();
 }
 
 static void check_for_stop(void) {
@@ -769,59 +1074,72 @@ static void check_for_stop(void) {
     }
 }
 
+static int sprint_u128(char *buf, size_t sz, uint128_t v);  /* forward decl */
+
 /* ============================================================================
  * GOLDBACH VERIFICATION — THREAD WORKER
  * ============================================================================ */
 
 typedef struct {
-    uint64_t start, end;
+    uint128_t start, end;
     int thread_id;
     volatile uint64_t verified_count;  /* volatile: read by checkpoint thread */
-    volatile uint64_t current_n;       /* track progress for checkpointing */
-    uint64_t max_attempts, max_attempts_n;
-    uint64_t counterexample;
+    volatile uint64_t current_n_lo;    /* low 64 bits of current N (for progress) */
+    volatile uint64_t current_n_hi;    /* high 64 bits (for ranges > uint64) */
+    uint64_t max_attempts;
+    uint128_t max_attempts_n;
+    uint128_t counterexample;
     uint64_t dual_checks;
     double elapsed;
 } ThreadWork;
+
+/* Helpers for reading/writing current_n (avoids torn 128-bit reads across threads) */
+static inline void set_current_n(ThreadWork *w, uint128_t n) {
+    w->current_n_lo = (uint64_t)n;
+    w->current_n_hi = (uint64_t)(n >> 64);
+}
+static inline uint128_t get_current_n(const ThreadWork *w) {
+    return ((uint128_t)w->current_n_hi << 64) | (uint128_t)w->current_n_lo;
+}
 
 static void *verify_range_thread(void *arg) {
     ThreadWork *work = (ThreadWork *)arg;
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-    uint64_t lo = work->start;
-    uint64_t hi = work->end;
+    uint128_t lo = work->start;
+    uint128_t hi = work->end;
     if (lo % 2 != 0) lo++;
     if (lo < 4) lo = 4;
 
     work->verified_count = 0;
-    work->current_n = lo;
+    set_current_n(work, lo);
     work->max_attempts = 0;
     work->max_attempts_n = 0;
     work->counterexample = 0;
     work->dual_checks = 0;
 
-    uint64_t margin = small_primes[num_small_primes - 1] + 100;
-    uint64_t check_range = 500000;
-    uint64_t total_range = check_range + margin;
-    uint64_t sieve_bytes = (total_range / 2 + 7) / 8 + 1024;
+    uint128_t margin = (num_small_primes > 0) ? small_primes[num_small_primes - 1] + 100 : 100;
+    uint128_t check_range = 500000;
+    uint128_t total_range = check_range + margin;
+    uint64_t sieve_bytes = (uint64_t)((total_range / 2 + 7) / 8) + 1024;
     uint8_t *sieve_buf = (uint8_t *)malloc(sieve_bytes);
     if (!sieve_buf) { fprintf(stderr, "Thread %d: malloc failed\n", work->thread_id); return NULL; }
 
     SegmentedSieve seg;
     seg.bits = sieve_buf;
 
-    uint64_t seg_lo = lo;
+    uint128_t seg_lo = lo;
     while (seg_lo <= hi && !stop_requested) {
-        uint64_t sieve_lo = (seg_lo > margin) ? seg_lo - margin : 2;
-        uint64_t sieve_hi = seg_lo + check_range;
+        uint128_t sieve_lo = (seg_lo > margin) ? seg_lo - margin : 2;
+        uint128_t sieve_hi = seg_lo + check_range;
         if (sieve_hi > hi) sieve_hi = hi;
 
         seg.lo = sieve_lo;
         seg.hi = sieve_hi;
         sieve_segment(&seg);
 
-        uint64_t check_hi = sieve_hi;
+        uint128_t check_hi = sieve_hi;
         if (check_hi > hi) check_hi = hi;
 
         if (fast_mode) {
@@ -835,24 +1153,25 @@ static void *verify_range_thread(void *arg) {
              * - q is always odd (n is even, p is odd for p>2) so skip even check
              */
             const uint8_t *sieve_bits = seg.bits;
-            uint64_t sieve_base = seg.base;
+            uint128_t sieve_base = seg.base;
 
             /* Macro for inlined sieve check: q must be odd and in range */
             #define FAST_CHECK(q) \
                 ((q) >= sieve_base && (q) <= sieve_hi && \
-                 !( sieve_bits[((q) - sieve_base) >> 4] & \
-                    (1u << ((((q) - sieve_base) >> 1) & 7)) ))
+                 !( sieve_bits[(uint64_t)(((q) - sieve_base) >> 4)] & \
+                    (1u << ((uint64_t)((((q) - sieve_base) >> 1)) & 7)) ))
 
-            for (uint64_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
+            for (uint128_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
 
                 /* Unrolled checks for p=2,3,5,7,11,13,17,19 (first 8 primes).
                  * p=2: q=n-2 is even, skip (can't be prime unless q=2).
                  * p=3,5,7,11,13,17,19: q=n-p is always odd since n is even. */
-                uint64_t q;
+                uint128_t q;
                 if (n > 3 && (q = n - 3, q >= sieve_base && q <= sieve_hi) &&
-                    !(sieve_bits[(q - sieve_base) >> 4] & (1u << (((q - sieve_base) >> 1) & 7))))
+                    !(sieve_bits[(uint64_t)((q - sieve_base) >> 4)] & (1u << ((uint64_t)((q - sieve_base) >> 1) & 7))))
+
                     { found = 1; attempts = 2; }
                 else if (n > 5 && (q = n - 5, FAST_CHECK(q)))
                     { found = 1; attempts = 3; }
@@ -869,7 +1188,7 @@ static void *verify_range_thread(void *arg) {
                 else {
                     /* Fall back to loop for remaining primes */
                     for (int i = 0; i < num_small_primes; i++) {
-                        uint64_t p = small_primes[i];
+                        uint128_t p = small_primes[i];
                         if (p >= n) break;
                         attempts++;
                         q = n - p;
@@ -877,8 +1196,8 @@ static void *verify_range_thread(void *arg) {
                         if (p == 2) { if (q == 2) { found = 1; break; } continue; }
                         /* q is odd — inline sieve check */
                         if (q >= sieve_base && q <= sieve_hi &&
-                            !(sieve_bits[(q - sieve_base) >> 4] &
-                              (1u << (((q - sieve_base) >> 1) & 7)))) {
+                            !(sieve_bits[(uint64_t)((q - sieve_base) >> 4)] &
+                              (1u << ((uint64_t)((q - sieve_base) >> 1) & 7)))) {
                             found = 1;
                             break;
                         }
@@ -887,18 +1206,31 @@ static void *verify_range_thread(void *arg) {
 
                 if (!found) {
                     /* ESCALATE: shortcut failed — full dual brute-force */
+                    char nbuf[50];
+                    sprint_u128(nbuf, sizeof(nbuf), n);
                     fprintf(stderr,
-                        "\n*** SHORTCUT EXHAUSTED at N=%" PRIu64 " ***\n"
-                        "Escalating to full dual-verified brute-force...\n", n);
+                        "\n*** SHORTCUT EXHAUSTED at N=%s ***\n"
+                        "Escalating to full dual-verified brute-force...\n", nbuf);
 
-                    for (uint64_t p2 = small_primes[num_small_primes - 1] + 2;
+                    for (uint128_t p2 = small_primes[num_small_primes - 1] + 2;
                          p2 <= n / 2; p2 += 2) {
-                        uint64_t q2 = n - p2;
-                        if (is_prime_miller_rabin(p2) && is_prime_bpsw(p2) &&
-                            is_prime_miller_rabin(q2) && is_prime_bpsw(q2)) {
+                        uint128_t q2 = n - p2;
+                        /* Use wide primality for numbers > uint64 */
+                        int p2_prime, q2_prime;
+                        if (p2 <= UINT64_MAX && q2 <= UINT64_MAX) {
+                            p2_prime = is_prime_miller_rabin((uint64_t)p2) && is_prime_bpsw((uint64_t)p2);
+                            q2_prime = is_prime_miller_rabin((uint64_t)q2) && is_prime_bpsw((uint64_t)q2);
+                        } else {
+                            p2_prime = is_prime_mr_wide(p2) && is_prime_bpsw_wide(p2);
+                            q2_prime = is_prime_mr_wide(q2) && is_prime_bpsw_wide(q2);
+                        }
+                        if (p2_prime && q2_prime) {
+                            char p2buf[50], q2buf[50];
+                            sprint_u128(p2buf, sizeof(p2buf), p2);
+                            sprint_u128(q2buf, sizeof(q2buf), q2);
                             fprintf(stderr,
-                                "  FOUND PAIR: %" PRIu64 " = %" PRIu64 " + %" PRIu64 "\n"
-                                "  (Required extended search)\n", n, p2, q2);
+                                "  FOUND PAIR: %s = %s + %s\n"
+                                "  (Required extended search)\n", nbuf, p2buf, q2buf);
                             work->dual_checks++;
                             found = 1;
                             break;
@@ -909,13 +1241,13 @@ static void *verify_range_thread(void *arg) {
                         fprintf(stderr,
                             "\n"
                             "************************************************************\n"
-                            "*** GOLDBACH COUNTEREXAMPLE: %" PRIu64 " ***\n"
+                            "*** GOLDBACH COUNTEREXAMPLE: %s ***\n"
                             "************************************************************\n"
                             "No pair of primes sums to this even number.\n"
                             "Full brute-force search completed (dual-verified).\n"
                             "THIS WOULD DISPROVE GOLDBACH'S CONJECTURE.\n"
                             "Verify independently before making any claims.\n"
-                            "************************************************************\n", n);
+                            "************************************************************\n", nbuf);
                         work->counterexample = n;
                     }
                 }
@@ -924,26 +1256,30 @@ static void *verify_range_thread(void *arg) {
                     work->max_attempts_n = n;
                 }
                 work->verified_count++;
-                work->current_n = n;
+                set_current_n(work, n);
             }
         } else {
             /* DUAL PATH: full MR+BPSW on every number */
-            for (uint64_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
+            for (uint128_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
 
                 for (int i = 0; i < num_small_primes; i++) {
-                    uint64_t p = small_primes[i];
+                    uint128_t p = small_primes[i];
                     if (p >= n) break;
                     attempts++;
-                    uint64_t q = n - p;
+                    uint128_t q = n - p;
                     if (seg_is_prime(&seg, q)) {
-                        /* DUAL VERIFICATION: confirm q with BPSW */
-                        if (!is_prime_bpsw(q)) {
+                        int bpsw_ok;
+                        if (q <= UINT64_MAX) bpsw_ok = is_prime_bpsw((uint64_t)q);
+                        else bpsw_ok = is_prime_bpsw_wide(q);
+                        if (!bpsw_ok) {
+                            char qbuf[50];
+                            sprint_u128(qbuf, sizeof(qbuf), q);
                             fprintf(stderr,
                                 "\n*** DUAL VERIFICATION FAILURE ***\n"
-                                "Sieve says %" PRIu64 " is prime, BPSW disagrees.\n"
-                                "HALTING.\n", q);
+                                "Sieve says %s is prime, BPSW disagrees.\n"
+                                "HALTING.\n", qbuf);
                             exit(2);
                         }
                         work->dual_checks++;
@@ -953,18 +1289,30 @@ static void *verify_range_thread(void *arg) {
                 }
 
                 if (!found) {
+                    char nbuf[50];
+                    sprint_u128(nbuf, sizeof(nbuf), n);
                     fprintf(stderr,
-                        "\n*** SHORTCUT EXHAUSTED at N=%" PRIu64 " ***\n"
-                        "Running full brute-force search (dual-verified)...\n", n);
+                        "\n*** SHORTCUT EXHAUSTED at N=%s ***\n"
+                        "Running full brute-force search (dual-verified)...\n", nbuf);
 
-                    for (uint64_t p2 = small_primes[num_small_primes - 1] + 2;
+                    for (uint128_t p2 = small_primes[num_small_primes - 1] + 2;
                          p2 <= n / 2; p2 += 2) {
-                        uint64_t q2 = n - p2;
-                        if (is_prime_miller_rabin(p2) && is_prime_bpsw(p2) &&
-                            is_prime_miller_rabin(q2) && is_prime_bpsw(q2)) {
+                        uint128_t q2 = n - p2;
+                        int p2_prime, q2_prime;
+                        if (p2 <= UINT64_MAX && q2 <= UINT64_MAX) {
+                            p2_prime = is_prime_miller_rabin((uint64_t)p2) && is_prime_bpsw((uint64_t)p2);
+                            q2_prime = is_prime_miller_rabin((uint64_t)q2) && is_prime_bpsw((uint64_t)q2);
+                        } else {
+                            p2_prime = is_prime_mr_wide(p2) && is_prime_bpsw_wide(p2);
+                            q2_prime = is_prime_mr_wide(q2) && is_prime_bpsw_wide(q2);
+                        }
+                        if (p2_prime && q2_prime) {
+                            char p2buf[50], q2buf[50];
+                            sprint_u128(p2buf, sizeof(p2buf), p2);
+                            sprint_u128(q2buf, sizeof(q2buf), q2);
                             fprintf(stderr,
-                                "  FOUND PAIR: %" PRIu64 " = %" PRIu64 " + %" PRIu64 "\n"
-                                "  (Required extended search)\n", n, p2, q2);
+                                "  FOUND PAIR: %s = %s + %s\n"
+                                "  (Required extended search)\n", nbuf, p2buf, q2buf);
                             work->dual_checks++;
                             found = 1;
                             break;
@@ -975,13 +1323,13 @@ static void *verify_range_thread(void *arg) {
                         fprintf(stderr,
                             "\n"
                             "************************************************************\n"
-                            "*** GOLDBACH COUNTEREXAMPLE: %" PRIu64 " ***\n"
+                            "*** GOLDBACH COUNTEREXAMPLE: %s ***\n"
                             "************************************************************\n"
                             "No pair of primes sums to this even number.\n"
                             "Full brute-force search completed (dual-verified).\n"
                             "THIS WOULD DISPROVE GOLDBACH'S CONJECTURE.\n"
                             "Verify independently before making any claims.\n"
-                            "************************************************************\n", n);
+                            "************************************************************\n", nbuf);
                         work->counterexample = n;
                     }
                 }
@@ -990,7 +1338,7 @@ static void *verify_range_thread(void *arg) {
                     work->max_attempts_n = n;
                 }
                 work->verified_count++;
-                work->current_n = n;
+                set_current_n(work, n);
             }
         }
         seg_lo = check_hi + 2;
@@ -1007,8 +1355,6 @@ static void *verify_range_thread(void *arg) {
 /* ============================================================================
  * TOP-10 TRACKER — for beyond and suspect modes
  * ============================================================================ */
-
-static int sprint_u128(char *buf, size_t sz, uint128_t v);  /* forward decl */
 
 #define TOP_N 10
 
@@ -1139,40 +1485,61 @@ static int verify_certificate_file(const char *filename) {
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
 
-        uint64_t n, p, q;
-        if (sscanf(line, "%" SCNu64 "=%" SCNu64 "+%" SCNu64, &n, &p, &q) != 3) continue;
+        /* Parse N=p+q where values may exceed uint64 */
+        uint128_t n = 0, p = 0, q = 0;
+        const char *s = line;
+        while (*s >= '0' && *s <= '9') { n = n * 10 + (*s - '0'); s++; }
+        if (*s != '=') continue; s++;
+        while (*s >= '0' && *s <= '9') { p = p * 10 + (*s - '0'); s++; }
+        if (*s != '+') continue; s++;
+        while (*s >= '0' && *s <= '9') { q = q * 10 + (*s - '0'); s++; }
 
         checked++;
         int ok = 1;
 
         /* Check 1: p + q == n */
         if (p + q != n) {
-            printf("  FAIL: %" PRIu64 " + %" PRIu64 " != %" PRIu64 "\n", p, q, n);
+            char nb[50], pb[50], qb[50];
+            sprint_u128(nb, sizeof(nb), n);
+            sprint_u128(pb, sizeof(pb), p);
+            sprint_u128(qb, sizeof(qb), q);
+            printf("  FAIL: %s + %s != %s\n", pb, qb, nb);
             ok = 0;
         }
 
-        /* Check 2: p is prime (dual verified) */
-        if (ok && is_prime_miller_rabin(p) != is_prime_bpsw(p)) {
-            printf("  DUAL FAILURE on p=%" PRIu64 "\n", p);
-            ok = 0;
-        } else if (ok && !is_prime_miller_rabin(p)) {
-            printf("  FAIL: p=%" PRIu64 " is not prime\n", p);
-            ok = 0;
+        /* Check 2: p is prime (dual, auto-selects width) */
+        if (ok) {
+            int p_mr  = (p <= UINT64_MAX) ? is_prime_miller_rabin((uint64_t)p) : is_prime_mr_wide(p);
+            int p_bpsw = (p <= UINT64_MAX) ? is_prime_bpsw((uint64_t)p) : is_prime_bpsw_wide(p);
+            if (p_mr != p_bpsw) {
+                char pb[50]; sprint_u128(pb, sizeof(pb), p);
+                printf("  DUAL FAILURE on p=%s\n", pb); ok = 0;
+            } else if (!p_mr) {
+                char pb[50]; sprint_u128(pb, sizeof(pb), p);
+                printf("  FAIL: p=%s is not prime\n", pb); ok = 0;
+            }
         }
 
-        /* Check 3: q is prime (dual verified) */
-        if (ok && is_prime_miller_rabin(q) != is_prime_bpsw(q)) {
-            printf("  DUAL FAILURE on q=%" PRIu64 "\n", q);
-            ok = 0;
-        } else if (ok && !is_prime_miller_rabin(q)) {
-            printf("  FAIL: q=%" PRIu64 " is not prime\n", q);
-            ok = 0;
+        /* Check 3: q is prime (dual, auto-selects width) */
+        if (ok) {
+            int q_mr  = (q <= UINT64_MAX) ? is_prime_miller_rabin((uint64_t)q) : is_prime_mr_wide(q);
+            int q_bpsw = (q <= UINT64_MAX) ? is_prime_bpsw((uint64_t)q) : is_prime_bpsw_wide(q);
+            if (q_mr != q_bpsw) {
+                char qb[50]; sprint_u128(qb, sizeof(qb), q);
+                printf("  DUAL FAILURE on q=%s\n", qb); ok = 0;
+            } else if (!q_mr) {
+                char qb[50]; sprint_u128(qb, sizeof(qb), q);
+                printf("  FAIL: q=%s is not prime\n", qb); ok = 0;
+            }
         }
 
         if (ok) {
             passed++;
-            char cert[128];
-            int len = snprintf(cert, sizeof(cert), "%" PRIu64 "=%" PRIu64 "+%" PRIu64 "\n", n, p, q);
+            char nb[50], pb[50], qb[50], cert[160];
+            sprint_u128(nb, sizeof(nb), n);
+            sprint_u128(pb, sizeof(pb), p);
+            sprint_u128(qb, sizeof(qb), q);
+            int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nb, pb, qb);
             sha256_update(&hash, cert, len);
         } else {
             failed++;
@@ -1360,16 +1727,17 @@ static uint64_t prior_verified = 0;
 static uint64_t prior_max_attempts = 0;
 static uint64_t prior_max_attempts_n = 0;
 
-static void write_checkpoint(uint64_t range_start, uint64_t range_end,
+static void write_checkpoint(uint128_t range_start, uint128_t range_end,
                              ThreadWork *work, int num_threads, double elapsed) {
     if (!checkpoint_file) return;
 
     /* Find minimum current_n across all threads = safe resume point */
-    uint64_t min_n = UINT64_MAX;
+    uint128_t min_n = (uint128_t)UINT64_MAX << 64 | UINT64_MAX;
     uint64_t total_verified = prior_verified;
     uint64_t cp_max_att = prior_max_attempts;
     for (int i = 0; i < num_threads; i++) {
-        if (work[i].current_n < min_n) min_n = work[i].current_n;
+        uint128_t cn = get_current_n(&work[i]);
+        if (cn < min_n) min_n = cn;
         total_verified += work[i].verified_count;
         if (work[i].max_attempts > cp_max_att) cp_max_att = work[i].max_attempts;
     }
@@ -1381,16 +1749,22 @@ static void write_checkpoint(uint64_t range_start, uint64_t range_end,
     FILE *f = fopen(tmp_path, "w");
     if (!f) return;
 
+    char rs_buf[50], re_buf[50];
+    sprint_u128(rs_buf, sizeof(rs_buf), range_start);
+    sprint_u128(re_buf, sizeof(re_buf), range_end);
+    /* min_n is uint128_t but checkpoint uses uint64_t for compatibility.
+     * For ranges > uint64, checkpointing is approximate (truncates to uint64). */
+    uint64_t min_n_64 = (min_n <= UINT64_MAX) ? (uint64_t)min_n : UINT64_MAX;
     fprintf(f, "GOLDBACH_CHECKPOINT v1\n");
-    fprintf(f, "range=%" PRIu64 "-%" PRIu64 "\n", range_start, range_end);
-    fprintf(f, "safe_resume=%" PRIu64 "\n", min_n);
+    fprintf(f, "range=%s-%s\n", rs_buf, re_buf);
+    fprintf(f, "safe_resume=%" PRIu64 "\n", min_n_64);
     fprintf(f, "threads=%d\n", num_threads);
     fprintf(f, "verified=%" PRIu64 "\n", total_verified);
     fprintf(f, "max_attempts=%" PRIu64 "\n", cp_max_att);
     fprintf(f, "elapsed=%.1f\n", elapsed);
 
     double rate = total_verified / (elapsed > 0 ? elapsed : 1);
-    uint64_t remaining = (range_end - min_n) / 2;
+    double remaining = (double)(range_end - min_n) / 2.0;
     double eta = remaining / (rate > 0 ? rate : 1);
     fprintf(f, "rate=%.0f\n", rate);
     fprintf(f, "eta_seconds=%.0f\n", eta);
@@ -1433,30 +1807,49 @@ static uint64_t read_checkpoint(uint64_t range_start, uint64_t range_end) {
     return range_start;
 }
 
-static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int num_threads) {
+static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int num_threads) {
     printf("MODE: Exhaustive verification (%s)\n",
            fast_mode ? "FAST — sieve-only, auto-escalates to dual MR+BPSW on failure"
                      : "dual-verified — MR + BPSW on every result");
-    printf("Range: %" PRIu64 " to %" PRIu64 "\n", range_start, range_end);
+    { char s1[50], s2[50];
+      sprint_u128(s1, sizeof(s1), range_start);
+      sprint_u128(s2, sizeof(s2), range_end);
+      printf("Range: %s to %s\n", s1, s2); }
     printf("Threads: %d\n", num_threads);
 
     /* Check for resume */
-    uint64_t effective_start = read_checkpoint(range_start, range_end);
+    uint128_t effective_start = (uint128_t)read_checkpoint(
+        (uint64_t)(range_start <= UINT64_MAX ? range_start : 0),
+        (uint64_t)(range_end <= UINT64_MAX ? range_end : 0));
+    if (effective_start < range_start) effective_start = range_start;
     if (effective_start > range_start) {
-        printf("Effective range: %" PRIu64 " to %" PRIu64 " (resumed)\n", effective_start, range_end);
+        char s1[50], s2[50];
+        sprint_u128(s1, sizeof(s1), effective_start);
+        sprint_u128(s2, sizeof(s2), range_end);
+        printf("Effective range: %s to %s (resumed)\n", s1, s2);
     }
     printf("\n");
 
     uint64_t sieve_limit = (uint64_t)sqrt((double)range_end) + 100;
     if (sieve_limit < 100000) sieve_limit = 100000;
-    printf("Generating base primes up to %" PRIu64 "...\n", sieve_limit);
-    generate_base_primes(sieve_limit);
+
+    /* Check if we have enough memory (skip if --cache forced) */
+    int mem_result = (using_mmap_primes == 2) ? 2 : check_memory(range_end, 1);
+    if (mem_result == 1) return;  /* user chose to abort */
+
+    if (mem_result == 2) {
+        /* Disk-cached generation */
+        generate_base_primes_cached(sieve_limit, "goldbach_primes.bin");
+    } else {
+        printf("Generating base primes up to %" PRIu64 "...\n", sieve_limit);
+        generate_base_primes(sieve_limit);
+    }
     printf("  %d base primes, %d small primes for shortcut\n\n", num_base_primes, num_small_primes);
 
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     ThreadWork *work = (ThreadWork *)malloc(num_threads * sizeof(ThreadWork));
-    uint64_t total_range = range_end - effective_start;
-    uint64_t range_per = (total_range / num_threads / 2) * 2;
+    uint128_t total_range = range_end - effective_start;
+    uint128_t range_per = (total_range / num_threads / 2) * 2;
 
     struct timespec ts_start, ts_end;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -1490,22 +1883,20 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
 
             /* Sum progress across threads */
             uint64_t total_v = 0;
-            uint64_t min_n = UINT64_MAX;
             all_done = 1;
             for (int i = 0; i < num_threads; i++) {
                 total_v += work[i].verified_count;
-                if (work[i].current_n < min_n) min_n = work[i].current_n;
-                /* Check if thread is still running (hasn't finished its range) */
-                if (work[i].current_n < work[i].end) all_done = 0;
+                uint128_t cn = get_current_n(&work[i]);
+                if (cn < work[i].end) all_done = 0;
             }
 
             double rate = total_v / (elapsed > 0 ? elapsed : 1);
-            uint64_t total_even = (range_end - effective_start) / 2;
-            uint64_t remaining = (total_even > total_v) ? total_even - total_v : 0;
+            double total_even = (double)(range_end - effective_start) / 2.0;
+            double remaining = (total_even > total_v) ? total_even - total_v : 0;
             double eta = remaining / (rate > 0 ? rate : 1);
 
-            /* Progress based on total work done, not slowest thread position */
-            double pct = 100.0 * total_v / (double)(total_even > 0 ? total_even : 1);
+            /* Progress based on total work done */
+            double pct = 100.0 * total_v / (total_even > 0 ? total_even : 1);
             fprintf(stderr, "\r  [%5.1f%%] %" PRIu64 " verified | %.0f/s | ETA: ",
                     pct, total_v, rate);
             if (eta < 120) fprintf(stderr, "%.0fs ", eta);
@@ -1540,8 +1931,9 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
 
     /* Aggregate */
     uint64_t total_verified = prior_verified, total_dual = 0;
-    uint64_t g_max_att = prior_max_attempts, g_max_att_n = prior_max_attempts_n;
-    uint64_t counterexample = 0;
+    uint64_t g_max_att = prior_max_attempts;
+    uint128_t g_max_att_n = prior_max_attempts_n;
+    uint128_t counterexample = 0;
 
     for (int i = 0; i < num_threads; i++) {
         total_verified += work[i].verified_count;
@@ -1559,43 +1951,46 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
                work[i].max_attempts, work[i].elapsed);
     }
 
-    /* Compute result hash from summary — thread-count-independent.
-     * Hash is deterministic for a given range + result, regardless of
-     * how many threads were used. Per-certificate integrity is handled
-     * separately via --cert + --verify. */
+    /* Compute result hash from summary — thread-count-independent */
+    char rs_h[50], re_h[50], ce_h[50];
+    sprint_u128(rs_h, sizeof(rs_h), range_start);
+    sprint_u128(re_h, sizeof(re_h), range_end);
+    sprint_u128(ce_h, sizeof(ce_h), counterexample);
+
     SHA256 master_hash;
     sha256_init(&master_hash);
     {
-        char summary[256];
+        char summary[512];
         int len = snprintf(summary, sizeof(summary),
-            "range=%" PRIu64 "-%" PRIu64
-            " verified=%" PRIu64
-            " max_attempts=%" PRIu64
-            " counterexample=%" PRIu64 "\n",
-            range_start, range_end, total_verified, g_max_att, counterexample);
+            "range=%s-%s verified=%" PRIu64 " max_attempts=%" PRIu64
+            " counterexample=%s\n",
+            rs_h, re_h, total_verified, g_max_att, ce_h);
         sha256_update(&master_hash, summary, len);
     }
 
     char master_hex[65];
     sha256_final(&master_hash, master_hex);
 
+    char man_buf[50];
+    sprint_u128(man_buf, sizeof(man_buf), g_max_att_n);
+
     printf("\n====================================================================\n");
     printf("  VERIFICATION RESULT\n");
     printf("====================================================================\n");
-    printf("  Range:              %" PRIu64 " to %" PRIu64 "\n", range_start, range_end);
+    printf("  Range:              %s to %s\n", rs_h, re_h);
     printf("  Even numbers:       %" PRIu64 "\n", total_verified);
     printf("  Dual-verified:      %" PRIu64 "\n", total_dual);
     printf("  Threads:            %d\n", num_threads);
     printf("  Wall time:          %.3f seconds\n", total_time);
     printf("  Rate:               %.0f verifications/sec\n", total_verified / total_time);
-    printf("  Max attempts:       %" PRIu64 " (at N=%" PRIu64 ")\n", g_max_att, g_max_att_n);
+    printf("  Max attempts:       %" PRIu64 " (at N=%s)\n", g_max_att, man_buf);
     printf("  SHA-256:            %s\n", master_hex);
 
     if (stop_requested) {
         printf("\n  INTERRUPTED — partial run. Checkpoint saved (if enabled).\n");
         printf("  Verified %" PRIu64 " even numbers before interruption.\n", total_verified);
     } else if (counterexample) {
-        printf("\n  *** COUNTEREXAMPLE: %" PRIu64 " ***\n", counterexample);
+        printf("\n  *** COUNTEREXAMPLE: %s ***\n", ce_h);
     } else {
         printf("\n  RESULT: Goldbach's Conjecture VERIFIED for entire range.\n");
         if (fast_mode) {
@@ -1609,15 +2004,15 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
     }
     printf("====================================================================\n");
 
-    printf("\n[SUMMARY] range=%" PRIu64 "-%" PRIu64
+    printf("\n[SUMMARY] range=%s-%s"
            " verified=%" PRIu64
            " dual_checked=%" PRIu64
            " max_attempts=%" PRIu64
-           " counterexample=%" PRIu64
+           " counterexample=%s"
            " time=%.3f rate=%.0f"
            " sha256=%s\n",
-           range_start, range_end, total_verified, total_dual, g_max_att,
-           counterexample, total_time, total_verified / total_time, master_hex);
+           rs_h, re_h, total_verified, total_dual, g_max_att,
+           ce_h, total_time, total_verified / total_time, master_hex);
 
     /* Clean up checkpoint on success */
     if (checkpoint_file && !counterexample) {
@@ -1629,6 +2024,162 @@ static void run_exhaustive_range(uint64_t range_start, uint64_t range_end, int n
 
     free(threads);
     free(work);
+}
+
+/* ============================================================================
+ * THREADED SAMPLING WORKER — shared by beyond and suspect modes
+ * ============================================================================ */
+
+static uint128_t generate_suspect(uint128_t near_scale, uint64_t variation);  /* forward decl */
+
+typedef struct {
+    /* Input */
+    int thread_id;
+    int num_samples;          /* how many to test */
+    int mode;                 /* 0=beyond (random), 1=suspect (CRT) */
+    uint128_t range_lo;       /* beyond: range start; suspect: scale low */
+    uint128_t range_size;     /* beyond: range width; suspect: scale range */
+    uint128_t suspect_scale;  /* suspect: fixed scale (if range_size==0) */
+    uint64_t rand_base;       /* suspect: random offset */
+    int start_idx;            /* suspect: starting index */
+    /* Output */
+    volatile int tested;  /* volatile: read by monitor */
+    int max_att;
+    uint128_t max_att_n;
+    int passed;
+    int proven_count;     /* numbers below MR_PROVEN_LIMIT */
+    int probabilistic_count;  /* numbers above */
+    long total_att;
+    FILE *cert_file;          /* shared cert file (NULL if no certs) */
+    pthread_mutex_t *cert_mutex;  /* mutex for cert file writes */
+    Top10 top;
+    SHA256 hash;
+} SampleWork;
+
+static void *sample_thread_func(void *arg) {
+    SampleWork *sw = (SampleWork *)arg;
+    sw->max_att = 0;
+    sw->max_att_n = 0;
+    sw->tested = 0;
+    sw->passed = 0;
+    sw->proven_count = 0;
+    sw->probabilistic_count = 0;
+    sw->total_att = 0;
+    top10_init(&sw->top);
+    sha256_init(&sw->hash);
+
+    /* Each thread needs its own RNG state — seed from thread_id + time */
+    unsigned short xsubi[3];
+    xsubi[0] = (unsigned short)(sw->thread_id * 7 + 1);
+    xsubi[1] = (unsigned short)(time(NULL) & 0xFFFF);
+    xsubi[2] = (unsigned short)((time(NULL) >> 16) ^ sw->thread_id);
+
+    for (int i = 0; i < sw->num_samples && !stop_requested; i++) {
+        uint128_t n;
+
+        if (sw->mode == 0) {
+            /* Beyond: random number in range */
+            uint64_t r1 = (uint64_t)(erand48(xsubi) * 4294967296.0);
+            uint64_t r2 = (uint64_t)(erand48(xsubi) * 4294967296.0);
+            uint64_t r3 = (uint64_t)(erand48(xsubi) * 4294967296.0);
+            uint64_t r4 = (uint64_t)(erand48(xsubi) * 4294967296.0);
+            uint128_t rand128 = ((uint128_t)((r1 << 32) | r2) << 64) |
+                                 (uint128_t)((r3 << 32) | r4);
+            uint128_t offset = rand128 % sw->range_size;
+            n = sw->range_lo + offset;
+        } else {
+            /* Suspect: CRT-constructed adversarial number at random scale.
+             * Use logarithmic sampling so numbers spread evenly across
+             * orders of magnitude (e.g., equal chance of 10^19 and 10^30). */
+            uint128_t scale;
+            if (sw->range_size > 0) {
+                double log_lo = log10((double)sw->range_lo);
+                double log_hi = log10((double)(sw->range_lo + sw->range_size));
+                double log_scale = log_lo + erand48(xsubi) * (log_hi - log_lo);
+                scale = (uint128_t)pow(10.0, log_scale);
+            } else {
+                scale = sw->suspect_scale;
+            }
+            n = generate_suspect(scale, sw->rand_base + sw->start_idx + i);
+        }
+
+        if (n % 2) n++;
+        if (n < 4) n = 4;
+
+        BeyondResult res = test_goldbach_single_wide(n);
+        sw->total_att += res.attempts;
+        sw->tested++;
+
+        if (res.dual_ok) {
+            sw->passed++;
+            if (n < MR_PROVEN_LIMIT) sw->proven_count++;
+            else sw->probabilistic_count++;
+            top10_insert(&sw->top, n);
+            char nbuf[50], pbuf[50], qbuf[50], cert[160];
+            sprint_u128(nbuf, sizeof(nbuf), res.n);
+            sprint_u128(pbuf, sizeof(pbuf), res.p);
+            sprint_u128(qbuf, sizeof(qbuf), res.q);
+            int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nbuf, pbuf, qbuf);
+            sha256_update(&sw->hash, cert, len);
+            /* Write cert to file immediately (survives interrupts) */
+            if (sw->cert_file && sw->cert_mutex) {
+                pthread_mutex_lock(sw->cert_mutex);
+                fputs(cert, sw->cert_file);
+                fflush(sw->cert_file);
+                pthread_mutex_unlock(sw->cert_mutex);
+            }
+        }
+        if (res.attempts > sw->max_att) {
+            sw->max_att = res.attempts;
+            sw->max_att_n = res.n;
+        }
+    }
+    return NULL;
+}
+
+/* Monitor loop for threaded sample modes — progress + q-to-stop */
+static void sample_monitor(pthread_t *tids, SampleWork *sw, int nthreads,
+                           int total_samples, struct timespec *ts_start) {
+    start_input_monitor();
+
+    int all_done = 0;
+    while (!all_done && !stop_requested) {
+        struct timespec req = {0, 300000000};  /* 300ms */
+        nanosleep(&req, NULL);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - ts_start->tv_sec) +
+                         (now.tv_nsec - ts_start->tv_nsec) / 1e9;
+
+        int total_done = 0;
+        all_done = 1;
+        for (int t = 0; t < nthreads; t++) {
+            total_done += sw[t].tested;
+            if (sw[t].tested < sw[t].num_samples) all_done = 0;
+        }
+
+        double rate = total_done / (elapsed > 0 ? elapsed : 1);
+        int remaining = total_samples - total_done;
+        double eta = remaining / (rate > 0 ? rate : 1);
+        double pct = 100.0 * total_done / (total_samples > 0 ? total_samples : 1);
+
+        fprintf(stderr, "\r  [%5.1f%%] %d/%d tested | %.0f/s | ETA: ",
+                pct, total_done, total_samples, rate);
+        if (eta < 120) fprintf(stderr, "%.0fs ", eta);
+        else if (eta < 7200) fprintf(stderr, "%.1fmin ", eta / 60);
+        else fprintf(stderr, "%.1fhrs ", eta / 3600);
+        fprintf(stderr, " [q to stop]  ");
+        fflush(stderr);
+
+        check_for_stop();
+    }
+
+    fprintf(stderr, "\n");
+    stop_input_monitor();
+
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
 }
 
 static void run_beyond(int num_samples, const char *cert_file,
@@ -1649,88 +2200,73 @@ static void run_beyond(int num_samples, const char *cert_file,
         fprintf(cf, "# Both p and q are dual-verified primes.\n#\n");
     }
 
-    srand48(time(NULL));
+    pthread_mutex_t cert_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-    SHA256 hash;
-    sha256_init(&hash);
-
-    /* Build sampling ranges — use custom range if provided, otherwise defaults */
-    typedef struct { char label[64]; uint128_t lo, range; } TR;
-    TR ranges[4];
-    int nranges;
-
+    /* Build sampling range */
+    uint128_t range_lo, range_size;
     if (custom_lo > 0 && custom_hi > custom_lo) {
-        nranges = 1;
-        ranges[0].lo = custom_lo;
-        ranges[0].range = custom_hi - custom_lo;
-        snprintf(ranges[0].label, sizeof(ranges[0].label),
-                 "%.3e to %.3e", (double)custom_lo, (double)custom_hi);
-        printf("Sampling range: %s\n\n", ranges[0].label);
+        range_lo = custom_lo;
+        range_size = custom_hi - custom_lo;
+        printf("Sampling range: %.3e to %.3e\n\n", (double)custom_lo, (double)custom_hi);
     } else {
-        nranges = 3;
-        ranges[0].lo = (uint128_t)4000000000000000000ULL;
-        ranges[0].range = 1000000000000ULL;
-        snprintf(ranges[0].label, sizeof(ranges[0].label), "4×10^18 + random");
-        ranges[1].lo = (uint128_t)5000000000000000000ULL;
-        ranges[1].range = 1000000000000ULL;
-        snprintf(ranges[1].label, sizeof(ranges[1].label), "5×10^18 + random");
-        ranges[2].lo = (uint128_t)10000000000000000000ULL;
-        ranges[2].range = 1000000000000ULL;
-        snprintf(ranges[2].label, sizeof(ranges[2].label), "10^19 + random");
-        printf("Sampling default zones past 4×10^18 record\n\n");
+        range_lo = (uint128_t)4000000000000000000ULL;
+        range_size = (uint128_t)10000000000000000000ULL - range_lo + 1000000000000ULL;
+        printf("Sampling default zone: 4×10^18 to 10^19\n\n");
     }
 
+    /* Launch threads */
+    int nthreads = detect_cores();
+    printf("Threads: %d\n\n", nthreads);
+    pthread_t *tids = (pthread_t *)malloc(nthreads * sizeof(pthread_t));
+    SampleWork *sw = (SampleWork *)malloc(nthreads * sizeof(SampleWork));
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    for (int t = 0; t < nthreads; t++) {
+        sw[t].thread_id = t;
+        sw[t].num_samples = num_samples / nthreads + (t < num_samples % nthreads ? 1 : 0);
+        sw[t].mode = 0;  /* beyond */
+        sw[t].range_lo = range_lo;
+        sw[t].range_size = range_size;
+        sw[t].cert_file = cf;
+        sw[t].cert_mutex = &cert_mutex;
+        pthread_create(&tids[t], NULL, sample_thread_func, &sw[t]);
+    }
+
+    /* Monitor progress + q-to-stop while threads run */
+    sample_monitor(tids, sw, nthreads, num_samples, &ts0);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
+
+    /* Merge results */
     int g_max_att = 0;
     uint128_t g_max_n = 0;
     int total = 0, total_pass = 0;
+    long total_att = 0;
     Top10 top;
     top10_init(&top);
+    SHA256 hash;
+    sha256_init(&hash);
 
-    for (int r = 0; r < nranges; r++) {
-        printf("Range: %s\n", ranges[r].label);
-        int rmax = 0; int fails = 0; long tatt = 0;
-        struct timespec ts0, ts1;
-        clock_gettime(CLOCK_MONOTONIC, &ts0);
-
-        int spr = num_samples / nranges;
-        for (int i = 0; i < spr; i++) {
-            /* Generate random offset across the full range.
-             * Combine four 32-bit randoms for a 128-bit value, then mod by range. */
-            uint64_t r1 = (uint64_t)(drand48() * 4294967296.0);
-            uint64_t r2 = (uint64_t)(drand48() * 4294967296.0);
-            uint64_t r3 = (uint64_t)(drand48() * 4294967296.0);
-            uint64_t r4 = (uint64_t)(drand48() * 4294967296.0);
-            uint128_t rand128 = ((uint128_t)((r1 << 32) | r2) << 64) |
-                                 (uint128_t)((r3 << 32) | r4);
-            uint128_t offset = rand128 % ranges[r].range;
-            uint128_t n = ranges[r].lo + offset;
-            if (n % 2) n++;
-            if (n < 4) n = 4;
-
-            BeyondResult res = test_goldbach_single_wide(n);
-            if (res.dual_ok) top10_insert(&top, n);
-            tatt += res.attempts;
-            if (res.dual_ok) {
-                total_pass++;
-                char nbuf[50], pbuf[50], qbuf[50], cert[160];
-                sprint_u128(nbuf, sizeof(nbuf), res.n);
-                sprint_u128(pbuf, sizeof(pbuf), res.p);
-                sprint_u128(qbuf, sizeof(qbuf), res.q);
-                int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nbuf, pbuf, qbuf);
-                sha256_update(&hash, cert, len);
-                if (cf) fputs(cert, cf);
-            } else { fails++; }
-            if (res.attempts > rmax) { rmax = res.attempts; g_max_n = res.n; }
-            total++;
+    for (int t = 0; t < nthreads; t++) {
+        total += sw[t].tested;
+        total_pass += sw[t].passed;
+        total_att += sw[t].total_att;
+        if (sw[t].max_att > g_max_att) {
+            g_max_att = sw[t].max_att;
+            g_max_n = sw[t].max_att_n;
         }
-
-        clock_gettime(CLOCK_MONOTONIC, &ts1);
-        double el = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
-        if (rmax > g_max_att) g_max_att = rmax;
-
-        printf("  %d/%d passed | Avg att: %.1f | Max: %d | %.2fs | %.0f/s\n",
-               spr - fails, spr, (double)tatt/spr, rmax, el, spr/el);
+        for (int j = 0; j < sw[t].top.count; j++)
+            top10_insert(&top, sw[t].top.values[j]);
+        char thex[65];
+        sha256_final(&sw[t].hash, thex);
+        sha256_update(&hash, thex, 64);
     }
+
+    free(tids);
+    /* sw freed after result output */
 
     char hex[65];
     sha256_final(&hash, hex);
@@ -1746,9 +2282,19 @@ static void run_beyond(int num_samples, const char *cert_file,
     printf("\n====================================================================\n");
     printf("  BEYOND-RECORD RESULT (DUAL VERIFIED)\n");
     printf("====================================================================\n");
+    int total_proven = 0, total_prob = 0;
+    for (int t = 0; t < nthreads; t++) {
+        total_proven += sw[t].proven_count;
+        total_prob += sw[t].probabilistic_count;
+    }
+
+    double avg_att = (double)total_att / (total > 0 ? total : 1);
     printf("  Total tested:   %d\n", total);
-    printf("  Total passed:   %d\n", total_pass);
+    printf("  Total passed:   %d  (%d proven, %d probabilistic)\n",
+           total_pass, total_proven, total_prob);
+    printf("  Avg attempts:   %.1f\n", avg_att);
     printf("  Max attempts:   %d (at N=%s)\n", g_max_att, max_n_buf);
+    printf("  Time:           %.2fs (%.0f/s)\n", elapsed, total / (elapsed > 0 ? elapsed : 1));
     printf("  SHA-256:        %s\n", hex);
     if (used_probabilistic_mode) {
         printf("  Verification:   PROBABILISTIC (numbers exceed 3.317×10^24)\n");
@@ -1763,6 +2309,9 @@ static void run_beyond(int num_samples, const char *cert_file,
         printf("  All tested numbers satisfy Goldbach.\n");
     top10_print(&top);
     printf("====================================================================\n");
+
+    /* cert writes already flushed to disk by threads */
+    free(sw);
 }
 
 /* ============================================================================
@@ -1811,10 +2360,11 @@ static uint128_t generate_suspect(uint128_t near_scale, uint64_t variation) {
     return n;
 }
 
-static void run_suspect(int num_samples, uint128_t scale, const char *cert_file) {
+static void run_suspect(int num_samples, uint128_t scale_lo, uint128_t scale_hi,
+                        const char *cert_file) {
     printf("MODE: Suspect (adversarial) verification (dual-verified)\n");
     printf("Samples: %d\n", num_samples);
-    printf("Target scale: %.3e\n", (double)scale);
+    printf("Scale range: %.3e to %.3e\n", (double)scale_lo, (double)scale_hi);
     if (cert_file) printf("Certificate file: %s\n", cert_file);
 
     printf("\nConstructing adversarial numbers:\n");
@@ -1834,105 +2384,75 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
         fprintf(cf, "# Format: N=p+q\n#\n");
     }
 
+    pthread_mutex_t cert_mutex = PTHREAD_MUTEX_INITIALIZER;
     srand48(time(NULL));
+    uint64_t rand_base = (uint64_t)(drand48() * 10000);
 
-    SHA256 hash;
-    sha256_init(&hash);
+    /* Launch threads */
+    int nthreads = detect_cores();
+    printf("Threads: %d\n\n", nthreads);
+    pthread_t *tids = (pthread_t *)malloc(nthreads * sizeof(pthread_t));
+    SampleWork *sw = (SampleWork *)malloc(nthreads * sizeof(SampleWork));
 
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    for (int t = 0; t < nthreads; t++) {
+        sw[t].thread_id = t;
+        sw[t].num_samples = num_samples / nthreads + (t < num_samples % nthreads ? 1 : 0);
+        sw[t].mode = 1;  /* suspect */
+        sw[t].range_lo = scale_lo;
+        sw[t].range_size = (scale_hi > scale_lo) ? scale_hi - scale_lo : 0;
+        sw[t].suspect_scale = scale_lo;  /* fallback if range_size==0 */
+        sw[t].rand_base = rand_base;
+        /* Each thread gets a different starting index so they test different numbers */
+        int offset = 0;
+        for (int j = 0; j < t; j++)
+            offset += num_samples / nthreads + (j < num_samples % nthreads ? 1 : 0);
+        sw[t].start_idx = offset;
+        sw[t].cert_file = cf;
+        sw[t].cert_mutex = &cert_mutex;
+        pthread_create(&tids[t], NULL, sample_thread_func, &sw[t]);
+    }
+
+    /* Monitor progress + q-to-stop while threads run */
+    sample_monitor(tids, sw, nthreads, num_samples, &ts0);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
+
+    /* Merge results */
     int g_max_att = 0;
     uint128_t g_max_n = 0;
-    int start_idx = 0;
     int total = 0, total_pass = 0;
     long total_att = 0;
     Top10 top;
     top10_init(&top);
+    SHA256 hash;
+    sha256_init(&hash);
 
-    /* Resume from checkpoint if available */
-    if (checkpoint_file) {
-        FILE *cpf = fopen(checkpoint_file, "r");
-        if (cpf) {
-            char line[256];
-            while (fgets(line, sizeof(line), cpf))
-                sscanf(line, "suspect_idx=%d", &start_idx);
-            fclose(cpf);
-            if (start_idx > 0)
-                printf("  Resuming from checkpoint: index %d of %d\n\n", start_idx, num_samples);
+    for (int t = 0; t < nthreads; t++) {
+        total += sw[t].tested;
+        total_pass += sw[t].passed;
+        total_att += sw[t].total_att;
+        if (sw[t].max_att > g_max_att) {
+            g_max_att = sw[t].max_att;
+            g_max_n = sw[t].max_att_n;
         }
+        for (int j = 0; j < sw[t].top.count; j++)
+            top10_insert(&top, sw[t].top.values[j]);
+        char thex[65];
+        sha256_final(&sw[t].hash, thex);
+        sha256_update(&hash, thex, 64);
     }
-
-    /* Random base offset so each run tests different numbers.
-     * Keep it small — we only need a few hundred offset from the base k
-     * to avoid repeating the exact same set. */
-    uint64_t rand_base = (uint64_t)(drand48() * 10000);
-    /* But if resuming, use a fixed seed from the checkpoint */
-    if (start_idx > 0) rand_base = 0; /* deterministic on resume */
-
-    struct timespec ts0, ts1, last_cp;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
-    last_cp = ts0;
-
-    for (int i = start_idx; i < num_samples; i++) {
-        uint128_t n = generate_suspect(scale, rand_base + (uint64_t)i);
-
-        BeyondResult res = test_goldbach_single_wide(n);
-        if (res.dual_ok) top10_insert(&top, n);
-        total_att += res.attempts;
-        if (res.dual_ok) {
-            total_pass++;
-            char nbuf[50], pbuf[50], qbuf[50], cert[160];
-            sprint_u128(nbuf, sizeof(nbuf), res.n);
-            sprint_u128(pbuf, sizeof(pbuf), res.p);
-            sprint_u128(qbuf, sizeof(qbuf), res.q);
-            int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nbuf, pbuf, qbuf);
-            sha256_update(&hash, cert, len);
-            if (cf) fputs(cert, cf);
-        }
-        if (res.attempts > g_max_att) { g_max_att = res.attempts; g_max_n = res.n; }
-        total++;
-
-        /* Progress + checkpoint */
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double elapsed = (now.tv_sec - ts0.tv_sec) + (now.tv_nsec - ts0.tv_nsec) / 1e9;
-        double since_cp = (now.tv_sec - last_cp.tv_sec) + (now.tv_nsec - last_cp.tv_nsec) / 1e9;
-
-        if (num_samples >= 100 && i % (num_samples / 20) == 0 && i > start_idx) {
-            double rate = total / (elapsed > 0 ? elapsed : 1);
-            double eta = (num_samples - i) / (rate > 0 ? rate : 1);
-            fprintf(stderr, "\r  [%d%%] %d/%d tested | avg att: %.1f | %.0f/s | ETA: ",
-                    (int)(100.0 * i / num_samples), i, num_samples,
-                    (double)total_att / total, rate);
-            if (eta < 120) fprintf(stderr, "%.0fs  ", eta);
-            else if (eta < 7200) fprintf(stderr, "%.1fmin  ", eta / 60);
-            else fprintf(stderr, "%.1fhrs  ", eta / 3600);
-            fflush(stderr);
-        }
-
-        if (checkpoint_file && since_cp >= CHECKPOINT_INTERVAL) {
-            char tmp[512];
-            snprintf(tmp, sizeof(tmp), "%s.tmp", checkpoint_file);
-            FILE *cpf = fopen(tmp, "w");
-            if (cpf) {
-                fprintf(cpf, "GOLDBACH_SUSPECT_CHECKPOINT v1\n");
-                fprintf(cpf, "suspect_idx=%d\n", i + 1);
-                fprintf(cpf, "total=%d\n", num_samples);
-                fprintf(cpf, "passed=%d\n", total_pass);
-                fprintf(cpf, "elapsed=%.1f\n", elapsed);
-                fclose(cpf);
-                rename(tmp, checkpoint_file);
-            }
-            last_cp = now;
-        }
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double elapsed = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
-    if (num_samples >= 100) fprintf(stderr, "\n");
 
     char hex[65];
     sha256_final(&hash, hex);
     char max_n_buf[50];
     sprint_u128(max_n_buf, sizeof(max_n_buf), g_max_n);
+
+    free(tids);
+    free(sw);
 
     if (cf) {
         fprintf(cf, "# SHA-256: %s\n", hex);
@@ -1945,8 +2465,15 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
     printf("\n====================================================================\n");
     printf("  SUSPECT (ADVERSARIAL) RESULT — DUAL VERIFIED\n");
     printf("====================================================================\n");
+    int total_proven = 0, total_prob = 0;
+    for (int t = 0; t < nthreads; t++) {
+        total_proven += sw[t].proven_count;
+        total_prob += sw[t].probabilistic_count;
+    }
+
     printf("  Total tested:    %d\n", total);
-    printf("  Total passed:    %d\n", total_pass);
+    printf("  Total passed:    %d  (%d proven, %d probabilistic)\n",
+           total_pass, total_proven, total_prob);
     printf("  Avg attempts:    %.1f  (vs ~25 for random — %.1fx harder)\n",
            avg_att, avg_att / 25.0);
     printf("  Max attempts:    %d (at N=%s)\n", g_max_att, max_n_buf);
@@ -1969,6 +2496,8 @@ static void run_suspect(int num_samples, uint128_t scale, const char *cert_file)
     }
     top10_print(&top);
     printf("====================================================================\n");
+
+    /* cert writes already flushed to disk by threads */
 
     /* Clean up checkpoint on success */
     if (checkpoint_file) {
@@ -2021,7 +2550,7 @@ static void interactive_menu(void) {
         int ok = run_self_tests();
         printf("\nSelf-test: %s\n\n", ok ? "ALL PASSED" : "FAILED");
         if (!ok) { fprintf(stderr, "Self-test FAILED. Refusing to run.\n"); return; }
-        free(base_primes); base_primes = NULL;
+        if (using_mmap_primes) cleanup_mmap(); else free(base_primes); base_primes = NULL;
         num_base_primes = 0; num_small_primes = 0;
     }
 
@@ -2134,20 +2663,18 @@ static void interactive_menu(void) {
             fflush(stdout);
             char sp_yn = 'n';
             scanf(" %c", &sp_yn);
-            uint128_t s_scale;
+            uint128_t s_lo = (uint128_t)4000000000000000000ULL;  /* 4×10^18 */
+            uint128_t s_hi;
             if (sp_yn == 'y' || sp_yn == 'Y') {
-                /* Sample across full range — use midpoint of log scale */
-                s_scale = (uint128_t)1000000000000000000ULL *
-                          (uint128_t)1000000000000ULL;  /* 10^30 */
-                printf("  Scale: ~10^30 (proven + probabilistic)\n");
+                s_hi = (uint128_t)1000000000000000000ULL *
+                       (uint128_t)1000000000000000000ULL * (uint128_t)100; /* 10^38 */
+                printf("  Range: 4×10^18 to 10^38 (proven + probabilistic)\n");
             } else {
-                /* Sample across proven range — use midpoint */
-                s_scale = (uint128_t)1000000000000000000ULL *
-                          (uint128_t)1000000;  /* 10^24 */
-                printf("  Scale: ~10^24 (proven only)\n");
+                s_hi = MR_PROVEN_LIMIT;  /* 3.317×10^24 */
+                printf("  Range: 4×10^18 to 3.317×10^24 (proven only)\n");
             }
             printf("\n");
-            run_suspect(suspect_n, s_scale, NULL);
+            run_suspect(suspect_n, s_lo, s_hi, NULL);
             break;
         }
         case 5: {
@@ -2264,7 +2791,7 @@ int main(int argc, char **argv) {
 
     int selftest_only = 0, beyond_mode = 0, range_mode = 0, suspect_mode = 0;
     int beyond_count = 10000, suspect_count = 10000;
-    uint64_t range_start = 4, range_end = 1000000000ULL;
+    uint128_t range_start = 4, range_end = 1000000000ULL;
     uint128_t beyond_lo = 0, beyond_hi = 0;  /* 0 = use defaults */
     uint128_t suspect_scale = (uint128_t)4000000000000000000ULL;  /* default: 4×10^18 */
     int num_threads = detect_cores();
@@ -2309,8 +2836,8 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--range") == 0) {
             range_mode = 1;
-            if (i+1 < argc) range_start = (uint64_t)strtod(argv[++i], NULL);
-            if (i+1 < argc) range_end = (uint64_t)strtod(argv[++i], NULL);
+            if (i+1 < argc) range_start = (uint128_t)strtod(argv[++i], NULL);
+            if (i+1 < argc) range_end = (uint128_t)strtod(argv[++i], NULL);
             if (i+1 < argc && argv[i+1][0] != '-')
                 num_threads = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--verify") == 0 && i+1 < argc) {
@@ -2319,6 +2846,9 @@ int main(int argc, char **argv) {
             cert_file = argv[++i];
         } else if (strcmp(argv[i], "--fast") == 0) {
             fast_mode = 1;
+        } else if (strcmp(argv[i], "--cache") == 0) {
+            /* Force disk-cached prime generation */
+            using_mmap_primes = 2;  /* flag: force cache */
         } else if (strcmp(argv[i], "--checkpoint") == 0 && i+1 < argc) {
             checkpoint_file = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -2326,7 +2856,7 @@ int main(int argc, char **argv) {
             return 0;
         } else if (argv[i][0] != '-') {
             if (!range_mode && !beyond_mode) {
-                range_end = (uint64_t)strtod(argv[i], NULL);
+                range_end = (uint128_t)strtod(argv[i], NULL);
                 if (i+1 < argc && argv[i+1][0] != '-')
                     num_threads = atoi(argv[++i]);
             }
@@ -2361,7 +2891,7 @@ int main(int argc, char **argv) {
     num_base_primes = 0; num_small_primes = 0;
 
     if (suspect_mode) {
-        run_suspect(suspect_count, suspect_scale, cert_file);
+        run_suspect(suspect_count, suspect_scale, suspect_scale, cert_file);
     } else if (beyond_mode) {
         if (!cert_file) cert_file = "goldbach_certificates.txt";
         run_beyond(beyond_count, cert_file, beyond_lo, beyond_hi);
@@ -2371,6 +2901,10 @@ int main(int argc, char **argv) {
         if (range_end % 2) range_end--;
         run_exhaustive_range(range_start, range_end, num_threads);
     }
+
+    /* Cleanup */
+    if (using_mmap_primes) cleanup_mmap(); else if (base_primes) free(base_primes);
+    base_primes = NULL;
 
     return 0;
 }

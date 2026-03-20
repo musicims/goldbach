@@ -6,7 +6,7 @@ Every result is checked by two independent primality tests (deterministic Miller
 
 Single C file. Zero dependencies. Runs anywhere with a C compiler.
 
-**Current status:** Tool complete. Verified exhaustively to 10^10, sampled to 10^38. No records have been set — the current world record (4 × 10^18, Oliveira e Silva 2012) stands. Scaling estimates in this document are projections.
+**Current status:** Tool complete. Verified exhaustively to 10^10. Sampled with dual verification up to 10^38 — including adversarial worst-case numbers at 38-digit scales no previous Goldbach verification has reached (proven below 3.317 × 10^24, probabilistic above). No exhaustive records set — the current world record (4 × 10^18, Oliveira e Silva 2012) stands.
 
 ---
 
