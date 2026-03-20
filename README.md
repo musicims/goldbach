@@ -131,7 +131,7 @@ Exhaustive verification of any range you specify.
 ./goldbach --range 1e15 2e15 --fast --checkpoint p.txt
 ```
 
-**Limit:** Exhaustive `--range` handles up to ~1.84 × 10^19 (uint64, sieve-based).
+**Limit:** Exhaustive `--range` uses uint128 arithmetic — no hard type ceiling. The practical limit is available memory for base prime generation (sqrt of range_end must be sievable). Use `--cache` for disk-backed primes when RAM is insufficient. The engine warns automatically if memory is exceeded.
 
 ### 6. Cluster Mode
 
