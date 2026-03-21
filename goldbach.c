@@ -2146,7 +2146,7 @@ static uint128_t generate_suspect(uint128_t near_scale, uint64_t variation);  /*
 typedef struct {
     /* Input */
     int thread_id;
-    int num_samples;          /* how many to test */
+    int64_t num_samples;      /* how many to test */
     int mode;                 /* 0=beyond (random), 1=suspect (CRT) */
     uint128_t range_lo;       /* beyond: range start; suspect: scale low */
     uint128_t range_size;     /* beyond: range width; suspect: scale range */
@@ -2248,7 +2248,7 @@ static void *sample_thread_func(void *arg) {
 
 /* Monitor loop for threaded sample modes — progress + q-to-stop */
 static void sample_monitor(pthread_t *tids, SampleWork *sw, int nthreads,
-                           int total_samples, struct timespec *ts_start) {
+                           int64_t total_samples, struct timespec *ts_start) {
     start_input_monitor();
 
     int all_done = 0;
@@ -2269,12 +2269,12 @@ static void sample_monitor(pthread_t *tids, SampleWork *sw, int nthreads,
         }
 
         double rate = total_done / (elapsed > 0 ? elapsed : 1);
-        int remaining = total_samples - total_done;
+        int64_t remaining = total_samples - total_done;
         double eta = remaining / (rate > 0 ? rate : 1);
         double pct = 100.0 * total_done / (total_samples > 0 ? total_samples : 1);
 
-        fprintf(stderr, "\r  [%5.1f%%] %d/%d tested | %.0f/s | ETA: ",
-                pct, total_done, total_samples, rate);
+        fprintf(stderr, "\r  [%5.1f%%] %" PRId64 "/%" PRId64 " tested | %.0f/s | ETA: ",
+                pct, (int64_t)total_done, total_samples, rate);
         if (eta < 120) fprintf(stderr, "%.0fs ", eta);
         else if (eta < 7200) fprintf(stderr, "%.1fmin ", eta / 60);
         else fprintf(stderr, "%.1fhrs ", eta / 3600);
@@ -2291,10 +2291,10 @@ static void sample_monitor(pthread_t *tids, SampleWork *sw, int nthreads,
         pthread_join(tids[t], NULL);
 }
 
-static void run_beyond(int num_samples, const char *cert_file,
+static void run_beyond(int64_t num_samples, const char *cert_file,
                        uint128_t custom_lo, uint128_t custom_hi) {
     printf("MODE: Beyond-record sampling (dual-verified)\n");
-    printf("Samples: %d\n", num_samples);
+    printf("Samples: %" PRId64 "\n", num_samples);
     if (cert_file) printf("Certificate file: %s\n", cert_file);
 
     generate_base_primes(100000);
@@ -2469,10 +2469,10 @@ static uint128_t generate_suspect(uint128_t near_scale, uint64_t variation) {
     return n;
 }
 
-static void run_suspect(int num_samples, uint128_t scale_lo, uint128_t scale_hi,
+static void run_suspect(int64_t num_samples, uint128_t scale_lo, uint128_t scale_hi,
                         const char *cert_file) {
     printf("MODE: Suspect (adversarial) verification (dual-verified)\n");
-    printf("Samples: %d\n", num_samples);
+    printf("Samples: %" PRId64 "\n", num_samples);
     printf("Scale range: %.3e to %.3e\n", (double)scale_lo, (double)scale_hi);
     if (cert_file) printf("Certificate file: %s\n", cert_file);
 
@@ -2730,11 +2730,11 @@ static void interactive_menu(void) {
             char bc = '0';
             scanf(" %c", &bc);
             if (bc == '0') continue;
-            int beyond_n = 100000;
+            int64_t beyond_n = 100000;
             if (bc == 'b' || bc == 'B') {
                 printf("  Number of samples: ");
                 fflush(stdout);
-                scanf("%d", &beyond_n);
+                scanf("%" SCNd64, &beyond_n);
                 if (beyond_n < 1) beyond_n = 1;
             }
             /* Range selection */
@@ -2766,11 +2766,11 @@ static void interactive_menu(void) {
             char sc = '0';
             scanf(" %c", &sc);
             if (sc == '0') continue;
-            int suspect_n = 10000;
+            int64_t suspect_n = 10000;
             if (sc == 'b' || sc == 'B') {
                 printf("  Number of samples: ");
                 fflush(stdout);
-                scanf("%d", &suspect_n);
+                scanf("%" SCNd64, &suspect_n);
                 if (suspect_n < 1) suspect_n = 1;
             }
             /* Scale selection */
@@ -2905,7 +2905,7 @@ int main(int argc, char **argv) {
     }
 
     int selftest_only = 0, beyond_mode = 0, range_mode = 0, suspect_mode = 0;
-    int beyond_count = 10000, suspect_count = 10000;
+    int64_t beyond_count = 10000, suspect_count = 10000;
     uint128_t range_start = 4, range_end = 1000000000ULL;
     uint128_t beyond_lo = 0, beyond_hi = 0;  /* 0 = use defaults */
     uint128_t suspect_scale = (uint128_t)4000000000000000000ULL;  /* default: 4×10^18 */
@@ -2921,7 +2921,7 @@ int main(int argc, char **argv) {
             /* Parse: --beyond COUNT [LO HI]
              * COUNT is required, LO and HI are optional positional args */
             if (i+1 < argc && argv[i+1][0] != '-') {
-                beyond_count = (int)strtod(argv[i+1], NULL);
+                beyond_count = (int64_t)strtod(argv[i+1], NULL);
                 i++;
             }
             if (i+1 < argc && i+2 < argc &&
@@ -2942,7 +2942,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--suspect") == 0) {
             suspect_mode = 1;
             if (i+1 < argc && argv[i+1][0] != '-') {
-                suspect_count = (int)strtod(argv[i+1], NULL);
+                suspect_count = (int64_t)strtod(argv[i+1], NULL);
                 i++;
             }
             if (i+1 < argc && argv[i+1][0] != '-') {
