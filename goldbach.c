@@ -2189,15 +2189,13 @@ static void *sample_thread_func(void *arg) {
         uint128_t n;
 
         if (sw->mode == 0) {
-            /* Beyond: random number in range */
-            uint64_t r1 = (uint64_t)(erand48(xsubi) * 4294967296.0);
-            uint64_t r2 = (uint64_t)(erand48(xsubi) * 4294967296.0);
-            uint64_t r3 = (uint64_t)(erand48(xsubi) * 4294967296.0);
-            uint64_t r4 = (uint64_t)(erand48(xsubi) * 4294967296.0);
-            uint128_t rand128 = ((uint128_t)((r1 << 32) | r2) << 64) |
-                                 (uint128_t)((r3 << 32) | r4);
-            uint128_t offset = rand128 % sw->range_size;
-            n = sw->range_lo + offset;
+            /* Beyond: random number in range using log-scale distribution.
+             * Spreads samples evenly across orders of magnitude so both
+             * proven (<3.317×10^24) and probabilistic zones get coverage. */
+            double log_lo = log10((double)sw->range_lo);
+            double log_hi = log10((double)(sw->range_lo + sw->range_size));
+            double log_val = log_lo + erand48(xsubi) * (log_hi - log_lo);
+            n = (uint128_t)pow(10.0, log_val);
         } else {
             /* Suspect: CRT-constructed adversarial number at random scale.
              * Use logarithmic sampling so numbers spread evenly across
