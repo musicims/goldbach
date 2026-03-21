@@ -1473,92 +1473,178 @@ static BeyondResult test_goldbach_single_wide(uint128_t n) {
  * Format: N=p+q (one per line)
  */
 
-static int verify_certificate_file(const char *filename) {
-    FILE *f = fopen(filename, "r");
-    if (!f) { fprintf(stderr, "Cannot open %s\n", filename); return 1; }
+static int detect_cores(void);  /* forward decl */
 
-    printf("Verifying certificate file: %s\n", filename);
-    printf("Method: dual primality (Miller-Rabin + BPSW) on every value\n\n");
-
-    char line[256];
-    uint64_t checked = 0, passed = 0, failed = 0;
+/* Per-thread verify worker */
+typedef struct {
+    char **lines;             /* array of cert line pointers */
+    int num_lines;
+    volatile int checked;     /* progress counter */
+    int passed, failed;
     SHA256 hash;
-    sha256_init(&hash);
+} VerifyWork;
 
-    while (fgets(line, sizeof(line), f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
+static void *verify_thread_func(void *arg) {
+    VerifyWork *vw = (VerifyWork *)arg;
+    vw->checked = 0;
+    vw->passed = 0;
+    vw->failed = 0;
+    sha256_init(&vw->hash);
 
-        /* Parse N=p+q where values may exceed uint64 */
+    for (int i = 0; i < vw->num_lines && !stop_requested; i++) {
+        const char *s = vw->lines[i];
         uint128_t n = 0, p = 0, q = 0;
-        const char *s = line;
         while (*s >= '0' && *s <= '9') { n = n * 10 + (*s - '0'); s++; }
-        if (*s != '=') continue; s++;
+        if (*s != '=') { vw->checked++; continue; } s++;
         while (*s >= '0' && *s <= '9') { p = p * 10 + (*s - '0'); s++; }
-        if (*s != '+') continue; s++;
+        if (*s != '+') { vw->checked++; continue; } s++;
         while (*s >= '0' && *s <= '9') { q = q * 10 + (*s - '0'); s++; }
 
-        checked++;
         int ok = 1;
 
-        /* Check 1: p + q == n */
-        if (p + q != n) {
-            char nb[50], pb[50], qb[50];
-            sprint_u128(nb, sizeof(nb), n);
-            sprint_u128(pb, sizeof(pb), p);
-            sprint_u128(qb, sizeof(qb), q);
-            printf("  FAIL: %s + %s != %s\n", pb, qb, nb);
-            ok = 0;
-        }
+        if (p + q != n) ok = 0;
 
-        /* Check 2: p is prime (dual, auto-selects width) */
         if (ok) {
             int p_mr  = (p <= UINT64_MAX) ? is_prime_miller_rabin((uint64_t)p) : is_prime_mr_wide(p);
             int p_bpsw = (p <= UINT64_MAX) ? is_prime_bpsw((uint64_t)p) : is_prime_bpsw_wide(p);
-            if (p_mr != p_bpsw) {
-                char pb[50]; sprint_u128(pb, sizeof(pb), p);
-                printf("  DUAL FAILURE on p=%s\n", pb); ok = 0;
-            } else if (!p_mr) {
-                char pb[50]; sprint_u128(pb, sizeof(pb), p);
-                printf("  FAIL: p=%s is not prime\n", pb); ok = 0;
-            }
+            if (p_mr != p_bpsw || !p_mr) ok = 0;
         }
-
-        /* Check 3: q is prime (dual, auto-selects width) */
         if (ok) {
             int q_mr  = (q <= UINT64_MAX) ? is_prime_miller_rabin((uint64_t)q) : is_prime_mr_wide(q);
             int q_bpsw = (q <= UINT64_MAX) ? is_prime_bpsw((uint64_t)q) : is_prime_bpsw_wide(q);
-            if (q_mr != q_bpsw) {
-                char qb[50]; sprint_u128(qb, sizeof(qb), q);
-                printf("  DUAL FAILURE on q=%s\n", qb); ok = 0;
-            } else if (!q_mr) {
-                char qb[50]; sprint_u128(qb, sizeof(qb), q);
-                printf("  FAIL: q=%s is not prime\n", qb); ok = 0;
-            }
+            if (q_mr != q_bpsw || !q_mr) ok = 0;
         }
 
         if (ok) {
-            passed++;
+            vw->passed++;
             char nb[50], pb[50], qb[50], cert[160];
             sprint_u128(nb, sizeof(nb), n);
             sprint_u128(pb, sizeof(pb), p);
             sprint_u128(qb, sizeof(qb), q);
             int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nb, pb, qb);
-            sha256_update(&hash, cert, len);
+            sha256_update(&vw->hash, cert, len);
         } else {
-            failed++;
+            vw->failed++;
+            if (vw->failed <= 10) {
+                char nb[50]; sprint_u128(nb, sizeof(nb), n);
+                fprintf(stderr, "  FAIL: N=%s\n", nb);
+            }
         }
+        vw->checked++;
+    }
+    return NULL;
+}
+
+static int verify_certificate_file(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) { fprintf(stderr, "Cannot open %s\n", filename); return 1; }
+
+    printf("Verifying certificate file: %s\n", filename);
+    printf("Method: dual primality (Miller-Rabin + BPSW) on every value\n");
+
+    /* Read all cert lines into memory */
+    int capacity = 10000, count = 0;
+    char **lines = (char **)malloc(capacity * sizeof(char *));
+    char buf[256];
+    while (fgets(buf, sizeof(buf), f)) {
+        if (buf[0] == '#' || buf[0] == '\n') continue;
+        if (count >= capacity) {
+            capacity *= 2;
+            lines = (char **)realloc(lines, capacity * sizeof(char *));
+        }
+        lines[count++] = strdup(buf);
     }
     fclose(f);
 
-    char hex[65];
-    sha256_final(&hash, hex);
+    int nthreads = detect_cores();
+    printf("Certificates: %d\nThreads: %d\n\n", count, nthreads);
 
-    printf("Checked:  %" PRIu64 "\n", checked);
-    printf("Passed:   %" PRIu64 "\n", passed);
-    printf("Failed:   %" PRIu64 "\n", failed);
+    pthread_t *tids = (pthread_t *)malloc(nthreads * sizeof(pthread_t));
+    VerifyWork *vw = (VerifyWork *)malloc(nthreads * sizeof(VerifyWork));
+
+    /* Split lines across threads */
+    int offset = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int chunk = count / nthreads + (t < count % nthreads ? 1 : 0);
+        vw[t].lines = &lines[offset];
+        vw[t].num_lines = chunk;
+        offset += chunk;
+    }
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+    for (int t = 0; t < nthreads; t++)
+        pthread_create(&tids[t], NULL, verify_thread_func, &vw[t]);
+
+    /* Monitor progress */
+    start_input_monitor();
+    int all_done = 0;
+    while (!all_done && !stop_requested) {
+        struct timespec req = {0, 300000000};
+        nanosleep(&req, NULL);
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - ts0.tv_sec) + (now.tv_nsec - ts0.tv_nsec) / 1e9;
+
+        int total_done = 0;
+        all_done = 1;
+        for (int t = 0; t < nthreads; t++) {
+            total_done += vw[t].checked;
+            if (vw[t].checked < vw[t].num_lines) all_done = 0;
+        }
+
+        double rate = total_done / (elapsed > 0 ? elapsed : 1);
+        double pct = 100.0 * total_done / (count > 0 ? count : 1);
+        double eta = (count - total_done) / (rate > 0 ? rate : 1);
+
+        fprintf(stderr, "\r  [%5.1f%%] %d/%d verified | %.0f/s | ETA: ",
+                pct, total_done, count, rate);
+        if (eta < 120) fprintf(stderr, "%.0fs ", eta);
+        else if (eta < 7200) fprintf(stderr, "%.1fmin ", eta / 60);
+        else fprintf(stderr, "%.1fhrs ", eta / 3600);
+        fprintf(stderr, " [q to stop]  ");
+        fflush(stderr);
+
+        check_for_stop();
+    }
+    fprintf(stderr, "\n");
+    stop_input_monitor();
+
+    for (int t = 0; t < nthreads; t++)
+        pthread_join(tids[t], NULL);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    double elapsed = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_nsec-ts0.tv_nsec)/1e9;
+
+    /* Merge results */
+    uint64_t total_passed = 0, total_failed = 0;
+    SHA256 master;
+    sha256_init(&master);
+    for (int t = 0; t < nthreads; t++) {
+        total_passed += vw[t].passed;
+        total_failed += vw[t].failed;
+        char thex[65];
+        sha256_final(&vw[t].hash, thex);
+        sha256_update(&master, thex, 64);
+    }
+    char hex[65];
+    sha256_final(&master, hex);
+
+    printf("Checked:  %d\n", count);
+    printf("Passed:   %" PRIu64 "\n", total_passed);
+    printf("Failed:   %" PRIu64 "\n", total_failed);
+    printf("Time:     %.2fs (%.0f/s)\n", elapsed, count / (elapsed > 0 ? elapsed : 1));
     printf("SHA-256:  %s\n", hex);
 
-    return failed > 0 ? 1 : 0;
+    /* Cleanup */
+    for (int i = 0; i < count; i++) free(lines[i]);
+    free(lines);
+    free(tids);
+    free(vw);
+
+    return total_failed > 0 ? 1 : 0;
 }
 
 /* ============================================================================
