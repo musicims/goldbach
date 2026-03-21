@@ -73,25 +73,28 @@ echo -e "Platform:  ${GREEN}${OS} ${ARCH}${NC}"
 echo -e "CPU cores: ${GREEN}${CORES}${NC}"
 
 # Pick optimal flags
-CFLAGS="-O3 -pthread -lm"
+CFLAGS="-O3 -pthread"
+LIBS="-lm"
 
 # Architecture-specific optimizations
 if [ "$ARCH" = "x86_64" ]; then
     # Test for march=native support
     if echo "int main(){return 0;}" | $CC -x c -march=native -o /dev/null - 2>/dev/null; then
-        CFLAGS="-O3 -march=native -pthread -lm"
+        CFLAGS="-O3 -march=native -pthread"
         echo -e "Tuning:    ${GREEN}native (auto-detected CPU features)${NC}"
     else
-        CFLAGS="-O3 -pthread -lm"
+        CFLAGS="-O3 -pthread"
+LIBS="-lm"
         echo -e "Tuning:    ${YELLOW}generic x86_64${NC}"
     fi
 elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
     # ARM64 (Apple Silicon, Graviton, etc.)
     if echo "int main(){return 0;}" | $CC -x c -march=native -o /dev/null - 2>/dev/null; then
-        CFLAGS="-O3 -march=native -pthread -lm"
+        CFLAGS="-O3 -march=native -pthread"
         echo -e "Tuning:    ${GREEN}native ARM64${NC}"
     else
-        CFLAGS="-O3 -pthread -lm"
+        CFLAGS="-O3 -pthread"
+LIBS="-lm"
         echo -e "Tuning:    ${YELLOW}generic ARM64${NC}"
     fi
 
@@ -105,8 +108,8 @@ fi
 # Build
 OUT="$SCRIPT_DIR/goldbach"
 echo ""
-echo -e "Building:  ${CYAN}$CC $CFLAGS goldbach.c -o goldbach${NC}"
-$CC $CFLAGS "$SRC" -o "$OUT"
+echo -e "Building:  ${CYAN}$CC $CFLAGS goldbach.c -o goldbach $LIBS${NC}"
+$CC $CFLAGS "$SRC" -o "$OUT" $LIBS
 
 # Verify it built
 if [ ! -x "$OUT" ]; then

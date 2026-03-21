@@ -2933,9 +2933,9 @@ int main(int argc, char **argv) {
                 /* Hard limit: ~3.4×10^38 (uint128 max), but practically
                  * limited by mulmod128 needing a+b < 2^128. Safe up to ~10^37.
                  * Past 3.317×10^24 the engine auto-switches to 24 witnesses. */
-                if (hi_d > 1e37) {
-                    fprintf(stderr, "Warning: HI clamped to 10^37 (uint128 arithmetic limit)\n");
-                    hi_d = 1e37;
+                if (hi_d > 1e38) {
+                    fprintf(stderr, "Warning: HI clamped to 10^38 (uint128 arithmetic limit)\n");
+                    hi_d = 1e38;
                 }
                 beyond_lo = (uint128_t)lo_d;
                 beyond_hi = (uint128_t)hi_d;
@@ -2949,9 +2949,9 @@ int main(int argc, char **argv) {
             }
             if (i+1 < argc && argv[i+1][0] != '-') {
                 double sv = strtod(argv[i+1], NULL);
-                if (sv > 1e37) {
-                    fprintf(stderr, "Warning: suspect scale clamped to 10^37 (uint128 arithmetic limit)\n");
-                    sv = 1e37;
+                if (sv > 1e38) {
+                    fprintf(stderr, "Warning: suspect scale clamped to 10^38 (uint128 arithmetic limit)\n");
+                    sv = 1e38;
                 }
                 suspect_scale = (uint128_t)sv;
                 i++;
