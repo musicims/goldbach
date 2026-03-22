@@ -1056,6 +1056,7 @@ static void restore_terminal(void) {
 static int atexit_registered = 0;
 
 static void start_input_monitor(void) {
+    if (!isatty(STDIN_FILENO)) return;  /* skip if no terminal (subprocess/pipe) */
     system("stty raw -echo");
     stty_raw_active = 1;
     if (!atexit_registered) {
@@ -2622,6 +2623,228 @@ static void run_suspect(int64_t num_samples, uint128_t scale_lo, uint128_t scale
  * INTERACTIVE MENU
  * ============================================================================ */
 
+/* ============================================================================
+ * COMMUNITY MODE — distributed verification client
+ * ============================================================================
+ *
+ * Connects to a coordination server, claims range chunks, verifies them
+ * with --fast mode, submits SHA-256 hashes. Loops until stopped.
+ * Uses curl via popen() — no library dependencies.
+ */
+
+static char community_url[512] = "";
+static int community_threads = 0;  /* 0 = use all cores */
+
+/* Simple JSON value extractor — finds "key": "value" or "key": number */
+static int json_get_str(const char *json, const char *key, char *out, int out_sz) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':' || *p == ' ') p++;
+    if (*p == '"') {
+        p++;
+        int i = 0;
+        while (*p && *p != '"' && i < out_sz - 1) out[i++] = *p++;
+        out[i] = 0;
+        return 1;
+    } else {
+        /* number or other literal */
+        int i = 0;
+        while (*p && *p != ',' && *p != '}' && *p != ' ' && i < out_sz - 1) out[i++] = *p++;
+        out[i] = 0;
+        return 1;
+    }
+}
+
+static int community_claim(const char *server, const char *client_id,
+                           char *start, char *end, char *chunk_id, int bufsz) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "curl -s '%s/api/claim?client=%s' 2>/dev/null", server, client_id);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+
+    char response[2048] = "";
+    size_t total = 0;
+    while (total < sizeof(response) - 1) {
+        size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    response[total] = 0;
+    pclose(fp);
+
+    if (strstr(response, "error")) {
+        printf("  Server: %s\n", response);
+        return 0;
+    }
+
+    if (!json_get_str(response, "start", start, bufsz)) return 0;
+    if (!json_get_str(response, "end", end, bufsz)) return 0;
+    if (!json_get_str(response, "chunk_id", chunk_id, bufsz)) return 0;
+
+    return 1;
+}
+
+static int community_submit(const char *server, const char *chunk_id,
+                            const char *sha256, const char *client_id) {
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s -X POST '%s/api/submit' "
+        "-H 'Content-Type: application/json' "
+        "-d '{\"chunk_id\": %s, \"sha256\": \"%s\", \"client_id\": \"%s\"}' 2>/dev/null",
+        server, chunk_id, sha256, client_id);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+
+    char response[2048] = "";
+    size_t total = 0;
+    while (total < sizeof(response) - 1) {
+        size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    response[total] = 0;
+    pclose(fp);
+
+    char status[64] = "";
+    json_get_str(response, "status", status, sizeof(status));
+    char message[256] = "";
+    json_get_str(response, "message", message, sizeof(message));
+
+    printf("  Server: %s — %s\n", status, message);
+    return (strlen(status) > 0);
+}
+
+static void community_status(const char *server) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "curl -s '%s/api/status' 2>/dev/null", server);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { printf("  Cannot reach server.\n"); return; }
+
+    char response[4096] = "";
+    size_t total = 0;
+    while (total < sizeof(response) - 1) {
+        size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    response[total] = 0;
+    pclose(fp);
+
+    char waterline[64], extension[64], verified[64], active[64];
+    json_get_str(response, "waterline", waterline, sizeof(waterline));
+    json_get_str(response, "extension", extension, sizeof(extension));
+    json_get_str(response, "total_verified", verified, sizeof(verified));
+    json_get_str(response, "active_clients", active, sizeof(active));
+
+    printf("\n  === COMMUNITY PROGRESS ===\n");
+    printf("  Waterline:       %s\n", waterline);
+    printf("  Extension:       %s\n", extension);
+    printf("  Chunks verified: %s\n", verified);
+    printf("  Active clients:  %s\n\n", active);
+}
+
+static void run_community(const char *server) {
+    printf("COMMUNITY MODE — Distributed Verification\n");
+    printf("Server: %s\n", server);
+
+    /* Generate or load client ID */
+    char client_id[64];
+    FILE *idf = fopen(".goldbach_client_id", "r");
+    if (idf) {
+        if (fgets(client_id, sizeof(client_id), idf)) {
+            /* Strip newline */
+            char *nl = strchr(client_id, '\n');
+            if (nl) *nl = 0;
+        }
+        fclose(idf);
+    } else {
+        /* Generate a simple unique ID from time + pid */
+        snprintf(client_id, sizeof(client_id), "client_%lx_%d",
+                 (unsigned long)time(NULL), getpid());
+        idf = fopen(".goldbach_client_id", "w");
+        if (idf) { fprintf(idf, "%s\n", client_id); fclose(idf); }
+    }
+    printf("Client ID: %s\n", client_id);
+
+    /* Show current status */
+    community_status(server);
+
+    /* Main loop */
+    int chunks_done = 0;
+    fast_mode = 1;  /* Community mode always uses fast */
+
+    while (!stop_requested) {
+        /* Claim a chunk */
+        char start_s[64], end_s[64], chunk_id_s[64];
+        printf("Claiming chunk...\n");
+
+        if (!community_claim(server, client_id, start_s, end_s, chunk_id_s, sizeof(start_s))) {
+            printf("  No chunks available. Waiting 60s...\n");
+            sleep(60);
+            continue;
+        }
+
+        uint128_t range_start = 0, range_end = 0;
+        /* Parse start/end strings to uint128 */
+        for (const char *s = start_s; *s >= '0' && *s <= '9'; s++)
+            range_start = range_start * 10 + (*s - '0');
+        for (const char *s = end_s; *s >= '0' && *s <= '9'; s++)
+            range_end = range_end * 10 + (*s - '0');
+
+        char rs[50], re[50];
+        sprint_u128(rs, sizeof(rs), range_start);
+        sprint_u128(re, sizeof(re), range_end);
+        printf("  Chunk %s: %s to %s\n", chunk_id_s, rs, re);
+
+        /* Run verification as subprocess to cleanly capture SHA-256 hash.
+         * This reuses the exact same goldbach binary with --range --fast. */
+        printf("  Verifying...\n");
+        stop_requested = 0;
+
+        char cmd[1024];
+        if (community_threads > 0) {
+            snprintf(cmd, sizeof(cmd),
+                "nice -n 19 ./goldbach --range %s %s %d --fast 2>/dev/null",
+                start_s, end_s, community_threads);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                "nice -n 19 ./goldbach --range %s %s --fast 2>/dev/null",
+                start_s, end_s);
+        }
+        FILE *fp = popen(cmd, "r");
+        char hash[128] = "";
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                /* Look for the SUMMARY line with sha256= */
+                char *hp = strstr(line, "sha256=");
+                if (hp) {
+                    hp += 7;  /* skip "sha256=" */
+                    int i = 0;
+                    while (hp[i] && hp[i] != '\n' && hp[i] != ' ' && i < 127)
+                        { hash[i] = hp[i]; i++; }
+                    hash[i] = 0;
+                }
+            }
+            pclose(fp);
+        }
+
+        if (strlen(hash) > 0) {
+            printf("  Hash: %s\n", hash);
+            community_submit(server, chunk_id_s, hash, client_id);
+            chunks_done++;
+            printf("  Chunks completed this session: %d\n\n", chunks_done);
+        } else {
+            printf("  ERROR: Could not extract hash. Skipping submission.\n\n");
+        }
+    }
+
+    printf("\nCommunity mode stopped. Completed %d chunks this session.\n", chunks_done);
+}
+
 static void interactive_menu(void) {
     int cores = detect_cores();
 
@@ -2635,7 +2858,8 @@ static void interactive_menu(void) {
     printf("    3. Beyond Record       Sample random numbers past 4×10^18\n");
     printf("    4. Suspect Mode        Test adversarial (hardest possible) numbers\n");
     printf("    5. Custom Range        Specify your own range\n");
-    printf("    6. Self-Test Only      Validate all components\n");
+    printf("    6. Community Mode      Join distributed verification effort\n");
+    printf("    7. Self-Test Only      Validate all components\n");
     printf("    0. Exit\n");
     printf("\n  SYSTEM:\n\n");
     printf("    Detected %d CPU cores — all modes use all available cores.\n", cores);
@@ -2645,7 +2869,7 @@ static void interactive_menu(void) {
     printf("    --checkpoint F   Auto-save progress every 60s, resume on restart\n");
     printf("    --range S E      Split ranges across machines (cluster mode)\n");
     printf("    --cert F         Write per-number proof certificates\n");
-    printf("\n  Choice [1-6, 0 to exit]: ");
+    printf("\n  Choice [1-7, 0 to exit]: ");
     fflush(stdout);
 
     int choice = 0;
@@ -2654,7 +2878,7 @@ static void interactive_menu(void) {
     printf("\n");
 
     /* Run self-test first for all computation modes */
-    if (choice >= 1 && choice <= 5) {
+    if (choice >= 1 && choice <= 5) {  /* modes needing self-test */
         /* Free previous base_primes to avoid leak on repeated menu runs */
         if (using_mmap_primes) cleanup_mmap();
         else if (base_primes) { free(base_primes); base_primes = NULL; }
@@ -2813,7 +3037,22 @@ static void interactive_menu(void) {
             run_exhaustive_range(start, end, cores);
             break;
         }
-        case 6:
+        case 6: {
+            printf("  COMMUNITY MODE — Join distributed verification\n\n");
+            char url[512];
+            printf("  Server URL (e.g., http://localhost:8080): ");
+            fflush(stdout);
+            scanf("%511s", url);
+            printf("  CPU threads to use (0 = all %d, or specify number): ", cores);
+            fflush(stdout);
+            int ct = 0;
+            scanf("%d", &ct);
+            if (ct > 0) community_threads = ct;
+            printf("\n");
+            run_community(url);
+            break;
+        }
+        case 7:
             printf("--- SELF-TEST (9 checks) ---\n");
             generate_base_primes(100000);
             {
@@ -2859,6 +3098,7 @@ static void print_usage(const char *prog) {
     printf("  %s --beyond COUNT [LO HI]       Sampling: test COUNT random numbers in [LO,HI]\n", prog);
     printf("  %s --suspect COUNT [SCALE]      Adversarial: test COUNT worst-case numbers near SCALE\n", prog);
     printf("  %s --verify FILE                Verify: check a certificate file independently\n", prog);
+    printf("  %s --community URL [--threads N] Join distributed verification effort\n", prog);
     printf("  %s --selftest                   Self-test: validate all components\n", prog);
     printf("\nOPTIONS:\n\n");
     printf("  --fast               Sieve-only mode (~39x faster, deterministic)\n");
@@ -2939,6 +3179,15 @@ int main(int argc, char **argv) {
                 beyond_hi = (uint128_t)hi_d;
                 i += 2;
             }
+        } else if (strcmp(argv[i], "--community") == 0) {
+            if (i+1 < argc) {
+                strncpy(community_url, argv[++i], sizeof(community_url) - 1);
+            }
+        } else if (strcmp(argv[i], "--threads") == 0) {
+            if (i+1 < argc) {
+                community_threads = atoi(argv[++i]);
+                if (community_threads < 1) community_threads = 1;
+            }
         } else if (strcmp(argv[i], "--suspect") == 0) {
             suspect_mode = 1;
             if (i+1 < argc && argv[i+1][0] != '-') {
@@ -2997,6 +3246,13 @@ int main(int argc, char **argv) {
 
     /* Install signal handler for clean interruption */
     signal(SIGINT, sigint_handler);
+
+    /* Community mode — runs its own loop, doesn't need selftest here
+     * (the subprocess runs selftest independently) */
+    if (strlen(community_url) > 0) {
+        run_community(community_url);
+        return 0;
+    }
 
     /* Self-test always runs first */
     printf("--- SELF-TEST (9 checks) ---\n");

@@ -4,3 +4,6 @@ goldbach_checkpoint.txt
 goldbach_checkpoint.txt.tmp
 DISTRIBUTED_PLAN.md
 *.o
+.goldbach_client_id
+goldbach_community.db
+server.log
