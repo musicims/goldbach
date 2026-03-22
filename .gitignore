@@ -2,4 +2,5 @@ goldbach
 goldbach_primes.bin
 goldbach_checkpoint.txt
 goldbach_checkpoint.txt.tmp
+DISTRIBUTED_PLAN.md
 *.o
