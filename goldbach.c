@@ -1910,7 +1910,10 @@ static uint64_t read_checkpoint(uint64_t range_start, uint64_t range_end) {
     return range_start;
 }
 
-static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int num_threads) {
+/* hash_out: if non-NULL, write the SHA-256 hash into it (65 bytes including null).
+ * Allows callers (like community mode) to capture the hash without subprocess. */
+static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int num_threads,
+                                 char *hash_out) {
     printf("MODE: Exhaustive verification (%s)\n",
            fast_mode ? "FAST — sieve-only, auto-escalates to dual MR+BPSW on failure"
                      : "dual-verified — MR + BPSW on every result");
@@ -1945,18 +1948,28 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
         return;
     }
 
-    /* Check if we have enough memory (skip if --cache forced) */
-    int mem_result = (using_mmap_primes == 2) ? 2 : check_memory(range_end, 1);
-    if (mem_result == 1) return;  /* user chose to abort */
-
-    if (mem_result == 2) {
-        /* Disk-cached generation */
-        generate_base_primes_cached(sieve_limit, "goldbach_primes.bin");
+    /* Skip prime generation if already loaded at sufficient level.
+     * The largest prime will be slightly below sieve_limit, so compare
+     * with a small margin. This avoids regenerating 98M primes each chunk
+     * in community mode when consecutive chunks have near-identical limits. */
+    if (base_primes && num_base_primes > 0 &&
+        (uint64_t)base_primes[num_base_primes - 1] + 1000 >= sieve_limit) {
+        printf("  Reusing %d base primes (sieve limit %" PRIu64 ")\n\n",
+               num_base_primes, sieve_limit);
     } else {
-        printf("Generating base primes up to %" PRIu64 "...\n", sieve_limit);
-        generate_base_primes(sieve_limit);
+        /* Check if we have enough memory (skip if --cache forced) */
+        int mem_result = (using_mmap_primes == 2) ? 2 : check_memory(range_end, 1);
+        if (mem_result == 1) return;  /* user chose to abort */
+
+        if (mem_result == 2) {
+            /* Disk-cached generation */
+            generate_base_primes_cached(sieve_limit, "goldbach_primes.bin");
+        } else {
+            printf("Generating base primes up to %" PRIu64 "...\n", sieve_limit);
+            generate_base_primes(sieve_limit);
+        }
+        printf("  %d base primes, %d small primes for shortcut\n\n", num_base_primes, num_small_primes);
     }
-    printf("  %d base primes, %d small primes for shortcut\n\n", num_base_primes, num_small_primes);
 
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     ThreadWork *work = (ThreadWork *)malloc(num_threads * sizeof(ThreadWork));
@@ -2082,6 +2095,7 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
 
     char master_hex[65];
     sha256_final(&master_hash, master_hex);
+    if (hash_out) strncpy(hash_out, master_hex, 65);
 
     char man_buf[50];
     sprint_u128(man_buf, sizeof(man_buf), g_max_att_n);
@@ -2799,38 +2813,13 @@ static void run_community(const char *server) {
         sprint_u128(re, sizeof(re), range_end);
         printf("  Chunk %s: %s to %s\n", chunk_id_s, rs, re);
 
-        /* Run verification as subprocess to cleanly capture SHA-256 hash.
-         * This reuses the exact same goldbach binary with --range --fast. */
+        /* Run verification in-process — shows progress bar, captures hash */
         printf("  Verifying...\n");
         stop_requested = 0;
 
-        char cmd[1024];
-        if (community_threads > 0) {
-            snprintf(cmd, sizeof(cmd),
-                "nice -n 19 ./goldbach --range %s %s %d --fast 2>/dev/null",
-                start_s, end_s, community_threads);
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                "nice -n 19 ./goldbach --range %s %s --fast 2>/dev/null",
-                start_s, end_s);
-        }
-        FILE *fp = popen(cmd, "r");
-        char hash[128] = "";
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                /* Look for the SUMMARY line with sha256= */
-                char *hp = strstr(line, "sha256=");
-                if (hp) {
-                    hp += 7;  /* skip "sha256=" */
-                    int i = 0;
-                    while (hp[i] && hp[i] != '\n' && hp[i] != ' ' && i < 127)
-                        { hash[i] = hp[i]; i++; }
-                    hash[i] = 0;
-                }
-            }
-            pclose(fp);
-        }
+        int threads = community_threads > 0 ? community_threads : detect_cores();
+        char hash[65] = "";
+        run_exhaustive_range(range_start, range_end, threads, hash);
 
         if (strlen(hash) > 0) {
             printf("  Hash: %s\n", hash);
@@ -2878,7 +2867,7 @@ static void interactive_menu(void) {
     printf("\n");
 
     /* Run self-test first for all computation modes */
-    if (choice >= 1 && choice <= 5) {  /* modes needing self-test */
+    if (choice >= 1 && choice <= 6) {  /* modes needing self-test */
         /* Free previous base_primes to avoid leak on repeated menu runs */
         if (using_mmap_primes) cleanup_mmap();
         else if (base_primes) { free(base_primes); base_primes = NULL; }
@@ -2901,7 +2890,7 @@ static void interactive_menu(void) {
             printf("  Checkpointing enabled — safe to interrupt and resume.\n\n");
             fast_mode = 1;
             checkpoint_file = "goldbach_checkpoint.txt";
-            run_exhaustive_range(4000000000000000000ULL, 5000000000000000000ULL, cores);
+            run_exhaustive_range(4000000000000000000ULL, 5000000000000000000ULL, cores, NULL);
             break;
         }
         case 2: {
@@ -2930,15 +2919,15 @@ static void interactive_menu(void) {
                 case '0':
                     continue;  /* back to menu loop */
                 case 'a': case 'A':
-                    run_exhaustive_range(4, 100000000ULL, cores); break;
+                    run_exhaustive_range(4, 100000000ULL, cores, NULL); break;
                 case 'b': case 'B':
-                    run_exhaustive_range(4, 1000000000ULL, cores); break;
+                    run_exhaustive_range(4, 1000000000ULL, cores, NULL); break;
                 case 'c': case 'C':
                     checkpoint_file = "goldbach_checkpoint.txt";
-                    run_exhaustive_range(4, 10000000000ULL, cores); break;
+                    run_exhaustive_range(4, 10000000000ULL, cores, NULL); break;
                 case 'd': case 'D':
                     checkpoint_file = "goldbach_checkpoint.txt";
-                    run_exhaustive_range(4, 100000000000ULL, cores); break;
+                    run_exhaustive_range(4, 100000000000ULL, cores, NULL); break;
                 default:
                     printf("Invalid level.\n");
             }
@@ -3034,7 +3023,7 @@ static void interactive_menu(void) {
             if (fast_yn == 'y' || fast_yn == 'Y') fast_mode = 1;
             printf("\n");
             checkpoint_file = "goldbach_checkpoint.txt";
-            run_exhaustive_range(start, end, cores);
+            run_exhaustive_range(start, end, cores, NULL);
             break;
         }
         case 6: {
@@ -3275,7 +3264,7 @@ int main(int argc, char **argv) {
         if (range_start < 4) range_start = 4;
         if (range_start % 2) range_start++;
         if (range_end % 2) range_end--;
-        run_exhaustive_range(range_start, range_end, num_threads);
+        run_exhaustive_range(range_start, range_end, num_threads, NULL);
     }
 
     /* Cleanup */

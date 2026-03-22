@@ -22,7 +22,7 @@ from urllib.parse import urlparse, parse_qs
 
 # Configuration
 RECORD_START = 4_000_000_000_000_000_000  # Current world record
-DEFAULT_CHUNK_SIZE = 10_000_000_000       # 10^10 even numbers = 2×10^10 range
+DEFAULT_CHUNK_SIZE = 1_000_000_000        # 10^9 even numbers = ~30s at 4×10^18 scale
 DEADLINE_SECONDS = 86400                   # 24 hours to complete a chunk
 # Dynamic chunk scaling: base size × (cores / 8)
 # 8-core machine → 10^10, 16-core → 2×10^10, 64-core → 8×10^10
