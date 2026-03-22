@@ -3029,7 +3029,7 @@ static void interactive_menu(void) {
         case 6: {
             printf("  COMMUNITY MODE — Join distributed verification\n\n");
             char url[512];
-            printf("  Server URL (e.g., http://localhost:8080): ");
+            printf("  Server URL (e.g., http://204.168.155.38): ");
             fflush(stdout);
             scanf("%511s", url);
             printf("  CPU threads to use (0 = all %d, or specify number): ", cores);

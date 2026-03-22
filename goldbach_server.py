@@ -24,6 +24,7 @@ from urllib.parse import urlparse, parse_qs
 RECORD_START = 4_000_000_000_000_000_000  # Current world record
 DEFAULT_CHUNK_SIZE = 1_000_000_000        # 10^9 even numbers = ~30s at 4×10^18 scale
 DEADLINE_SECONDS = 86400                   # 24 hours to complete a chunk
+MAX_OUTSTANDING = 2                        # Max assigned chunks per client
 # Dynamic chunk scaling: base size × (cores / 8)
 # 8-core machine → 10^10, 16-core → 2×10^10, 64-core → 8×10^10
 BASE_CORES = 8
@@ -183,6 +184,16 @@ class GoldbachHandler(BaseHTTPRequestHandler):
 
             # Expire stale assignments
             expire_stale(db)
+
+            # Cap outstanding chunks per client (prevent hoarding)
+            outstanding = db.execute(
+                "SELECT COUNT(*) FROM chunks WHERE assigned_to = ? AND status = 'assigned'",
+                (client_id,)
+            ).fetchone()[0]
+            if outstanding >= MAX_OUTSTANDING:
+                self.send_json({"error": "max outstanding chunks reached", "outstanding": outstanding}, 429)
+                db.close()
+                return
 
             # Priority 1: chunks needing double-check (where this client wasn't the first checker)
             chunk = db.execute("""
