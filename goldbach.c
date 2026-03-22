@@ -2646,7 +2646,8 @@ static void run_suspect(int64_t num_samples, uint128_t scale_lo, uint128_t scale
  * Uses curl via popen() — no library dependencies.
  */
 
-static char community_url[512] = "";
+static char community_url[512] = "https://api.prove-goldbach.com";
+static int community_mode = 0;
 static int community_threads = 0;  /* 0 = use all cores */
 
 /* Simple JSON value extractor — finds "key": "value" or "key": number */
@@ -3028,17 +3029,14 @@ static void interactive_menu(void) {
         }
         case 6: {
             printf("  COMMUNITY MODE — Join distributed verification\n\n");
-            char url[512];
-            printf("  Server URL (e.g., http://204.168.155.38): ");
-            fflush(stdout);
-            scanf("%511s", url);
+            printf("  Server: %s\n", community_url);
             printf("  CPU threads to use (0 = all %d, or specify number): ", cores);
             fflush(stdout);
             int ct = 0;
             scanf("%d", &ct);
             if (ct > 0) community_threads = ct;
             printf("\n");
-            run_community(url);
+            run_community(community_url);
             break;
         }
         case 7:
@@ -3087,7 +3085,7 @@ static void print_usage(const char *prog) {
     printf("  %s --beyond COUNT [LO HI]       Sampling: test COUNT random numbers in [LO,HI]\n", prog);
     printf("  %s --suspect COUNT [SCALE]      Adversarial: test COUNT worst-case numbers near SCALE\n", prog);
     printf("  %s --verify FILE                Verify: check a certificate file independently\n", prog);
-    printf("  %s --community URL [--threads N] Join distributed verification effort\n", prog);
+    printf("  %s --community [URL] [--threads N] Join distributed verification (default: public server)\n", prog);
     printf("  %s --selftest                   Self-test: validate all components\n", prog);
     printf("\nOPTIONS:\n\n");
     printf("  --fast               Sieve-only mode (~39x faster, deterministic)\n");
@@ -3169,7 +3167,9 @@ int main(int argc, char **argv) {
                 i += 2;
             }
         } else if (strcmp(argv[i], "--community") == 0) {
-            if (i+1 < argc) {
+            community_mode = 1;
+            /* URL is optional — defaults to public server */
+            if (i+1 < argc && strncmp(argv[i+1], "http", 4) == 0) {
                 strncpy(community_url, argv[++i], sizeof(community_url) - 1);
             }
         } else if (strcmp(argv[i], "--threads") == 0) {
@@ -3236,9 +3236,8 @@ int main(int argc, char **argv) {
     /* Install signal handler for clean interruption */
     signal(SIGINT, sigint_handler);
 
-    /* Community mode — runs its own loop, doesn't need selftest here
-     * (the subprocess runs selftest independently) */
-    if (strlen(community_url) > 0) {
+    /* Community mode — runs its own loop */
+    if (community_mode) {
         run_community(community_url);
         return 0;
     }
