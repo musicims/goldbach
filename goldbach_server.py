@@ -125,7 +125,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS certificates (
             id SERIAL PRIMARY KEY,
-            n TEXT NOT NULL,
+            n TEXT NOT NULL UNIQUE,
             p TEXT NOT NULL,
             q TEXT NOT NULL,
             mode TEXT,
@@ -749,6 +749,7 @@ class GoldbachHandler(BaseHTTPRequestHandler):
                         cur.execute("""
                             INSERT INTO certificates (n, p, q, mode, client_id, submitted_at)
                             VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (n) DO NOTHING
                         """, (n, p, q, mode, client_id, time.time()))
 
                 conn.commit()

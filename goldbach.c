@@ -3489,7 +3489,9 @@ static void run_community(const char *server) {
         char hash[65] = "";
         run_exhaustive_range(range_start, range_end, threads, hash);
 
-        if (strlen(hash) > 0) {
+        if (stop_requested) {
+            printf("  Interrupted — skipping submission for partial chunk.\n\n");
+        } else if (strlen(hash) > 0) {
             printf("  Hash: %s\n", hash);
             community_submit(server, chunk_id_s, hash, client_id);
             chunks_done++;
