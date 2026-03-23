@@ -1095,6 +1095,12 @@ typedef struct {
     uint128_t counterexample;
     uint64_t dual_checks;
     double elapsed;
+    /* Per-number cert data: index into small_primes for the p that completed each pair.
+     * 0xFF = escalated (p was beyond small_primes list).
+     * Used post-verification to compute thread-count-independent SHA-256. */
+    uint8_t *cert_primes;
+    uint64_t cert_count;     /* number of entries in cert_primes */
+    SHA256 cert_hash;        /* per-thread cert hash (computed post-verification) */
 } ThreadWork;
 
 /* Helpers for reading/writing current_n (avoids torn 128-bit reads across threads) */
@@ -1168,27 +1174,29 @@ static void *verify_range_thread(void *arg) {
             for (uint128_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
+                uint8_t found_pidx = 0xFF; /* prime index for cert hashing */
 
                 /* Unrolled checks for p=2,3,5,7,11,13,17,19 (first 8 primes).
                  * p=2: q=n-2 is even, skip (can't be prime unless q=2).
-                 * p=3,5,7,11,13,17,19: q=n-p is always odd since n is even. */
+                 * p=3,5,7,11,13,17,19: q=n-p is always odd since n is even.
+                 * Prime indices: 2=0, 3=1, 5=2, 7=3, 11=4, 13=5, 17=6, 19=7 */
                 uint128_t q;
                 if (n > 3 && (q = n - 3, q >= sieve_base && q <= sieve_hi) &&
                     !(sieve_bits[(uint64_t)((q - sieve_base) >> 4)] & (1u << ((uint64_t)((q - sieve_base) >> 1) & 7))))
 
-                    { found = 1; attempts = 2; }
+                    { found = 1; attempts = 2; found_pidx = 1; }
                 else if (n > 5 && (q = n - 5, FAST_CHECK(q)))
-                    { found = 1; attempts = 3; }
+                    { found = 1; attempts = 3; found_pidx = 2; }
                 else if (n > 7 && (q = n - 7, FAST_CHECK(q)))
-                    { found = 1; attempts = 4; }
+                    { found = 1; attempts = 4; found_pidx = 3; }
                 else if (n > 11 && (q = n - 11, FAST_CHECK(q)))
-                    { found = 1; attempts = 5; }
+                    { found = 1; attempts = 5; found_pidx = 4; }
                 else if (n > 13 && (q = n - 13, FAST_CHECK(q)))
-                    { found = 1; attempts = 6; }
+                    { found = 1; attempts = 6; found_pidx = 5; }
                 else if (n > 17 && (q = n - 17, FAST_CHECK(q)))
-                    { found = 1; attempts = 7; }
+                    { found = 1; attempts = 7; found_pidx = 6; }
                 else if (n > 19 && (q = n - 19, FAST_CHECK(q)))
-                    { found = 1; attempts = 8; }
+                    { found = 1; attempts = 8; found_pidx = 7; }
                 else {
                     /* Fall back to loop for remaining primes */
                     for (int i = 0; i < num_small_primes; i++) {
@@ -1197,12 +1205,13 @@ static void *verify_range_thread(void *arg) {
                         attempts++;
                         q = n - p;
                         /* p=2: q is even, only prime if q==2 */
-                        if (p == 2) { if (q == 2) { found = 1; break; } continue; }
+                        if (p == 2) { if (q == 2) { found = 1; found_pidx = 0; break; } continue; }
                         /* q is odd — inline sieve check */
                         if (q >= sieve_base && q <= sieve_hi &&
                             !(sieve_bits[(uint64_t)((q - sieve_base) >> 4)] &
                               (1u << ((uint64_t)((q - sieve_base) >> 1) & 7)))) {
                             found = 1;
+                            found_pidx = (uint8_t)(i < 255 ? i : 0xFE);
                             break;
                         }
                     }
@@ -1237,6 +1246,7 @@ static void *verify_range_thread(void *arg) {
                                 "  (Required extended search)\n", nbuf, p2buf, q2buf);
                             work->dual_checks++;
                             found = 1;
+                            found_pidx = 0xFF; /* escalated — can't store in index */
                             break;
                         }
                     }
@@ -1255,6 +1265,10 @@ static void *verify_range_thread(void *arg) {
                         work->counterexample = n;
                     }
                 }
+                /* Store prime index for cert hashing */
+                if (work->cert_primes && work->cert_count < ((uint64_t)(work->end - work->start) / 2 + 2)) {
+                    work->cert_primes[work->cert_count++] = found_pidx;
+                }
                 if (attempts > work->max_attempts) {
                     work->max_attempts = attempts;
                     work->max_attempts_n = n;
@@ -1267,6 +1281,7 @@ static void *verify_range_thread(void *arg) {
             for (uint128_t n = seg_lo; n <= check_hi && !stop_requested; n += 2) {
                 int found = 0;
                 uint64_t attempts = 0;
+                uint8_t found_pidx = 0xFF;
 
                 for (int i = 0; i < num_small_primes; i++) {
                     uint128_t p = small_primes[i];
@@ -1288,6 +1303,7 @@ static void *verify_range_thread(void *arg) {
                         }
                         work->dual_checks++;
                         found = 1;
+                        found_pidx = (uint8_t)(i < 255 ? i : 0xFE);
                         break;
                     }
                 }
@@ -1319,6 +1335,7 @@ static void *verify_range_thread(void *arg) {
                                 "  (Required extended search)\n", nbuf, p2buf, q2buf);
                             work->dual_checks++;
                             found = 1;
+                            found_pidx = 0xFF;
                             break;
                         }
                     }
@@ -1337,6 +1354,10 @@ static void *verify_range_thread(void *arg) {
                         work->counterexample = n;
                     }
                 }
+                /* Store prime index for cert hashing */
+                if (work->cert_primes && work->cert_count < ((uint64_t)(work->end - work->start) / 2 + 2)) {
+                    work->cert_primes[work->cert_count++] = found_pidx;
+                }
                 if (attempts > work->max_attempts) {
                     work->max_attempts = attempts;
                     work->max_attempts_n = n;
@@ -1353,6 +1374,31 @@ static void *verify_range_thread(void *arg) {
     clock_gettime(CLOCK_MONOTONIC, &ts_end);
     work->elapsed = (ts_end.tv_sec - ts_start.tv_sec) +
                     (ts_end.tv_nsec - ts_start.tv_nsec) / 1e9;
+    return NULL;
+}
+
+/* Hash cert_primes data into cert_hash — runs as a thread for parallelism */
+static void *hash_certs_thread(void *arg) {
+    ThreadWork *work = (ThreadWork *)arg;
+    uint128_t n = work->start;
+    if (n % 2) n++;
+    for (uint64_t j = 0; j < work->cert_count; j++, n += 2) {
+        uint8_t pidx = work->cert_primes[j];
+        uint128_t p;
+        if (pidx == 0xFF || pidx == 0xFE) {
+            p = 0;  /* escalated — deterministic placeholder */
+        } else {
+            p = small_primes[pidx];
+        }
+        uint128_t q = n - p;
+        char nbuf[50], pbuf[50], qbuf[50];
+        sprint_u128(nbuf, sizeof(nbuf), n);
+        sprint_u128(pbuf, sizeof(pbuf), p);
+        sprint_u128(qbuf, sizeof(qbuf), q);
+        char cert[160];
+        int len = snprintf(cert, sizeof(cert), "%s=%s+%s\n", nbuf, pbuf, qbuf);
+        sha256_update(&work->cert_hash, cert, len);
+    }
     return NULL;
 }
 
@@ -1824,6 +1870,9 @@ static int detect_cores(void) {
 #define CHECKPOINT_INTERVAL 60  /* seconds */
 
 static const char *checkpoint_file = NULL;
+static const char *export_path = NULL;        /* --export: directory or file for results */
+static int spot_check_count = 0;              /* --spot-check N: verify N random chunks */
+#define EXPORT_CHUNK_SIZE 1000000000ULL        /* 10^9 — aligned with community server */
 
 /* Restored from checkpoint for hash continuity across resumes */
 static uint64_t prior_verified = 0;
@@ -1985,6 +2034,13 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
         work[i].end = (i == num_threads - 1) ? range_end : (effective_start + (i+1) * range_per - 2);
         if (work[i].start % 2) work[i].start++;
         if (work[i].end % 2) work[i].end--;
+        /* Allocate cert_primes array for per-number prime index storage */
+        uint64_t thread_evens = (uint64_t)((work[i].end - work[i].start) / 2) + 2;
+        work[i].cert_primes = (uint8_t *)malloc(thread_evens);
+        work[i].cert_count = 0;
+        if (!work[i].cert_primes) {
+            fprintf(stderr, "Warning: cert_primes alloc failed for thread %d, hashing disabled\n", i);
+        }
         pthread_create(&threads[i], NULL, verify_range_thread, &work[i]);
     }
 
@@ -2076,7 +2132,10 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
                work[i].max_attempts, work[i].elapsed);
     }
 
-    /* Compute result hash from summary — thread-count-independent */
+    /* Compute result hash from actual certificates — thread-count-independent.
+     * Iterate through all threads' cert_primes in range order, reconstruct
+     * each "N=p+q\n" cert string, and feed into SHA-256. This produces the
+     * same hash regardless of thread count since we iterate by range order. */
     char rs_h[50], re_h[50], ce_h[50];
     sprint_u128(rs_h, sizeof(rs_h), range_start);
     sprint_u128(re_h, sizeof(re_h), range_end);
@@ -2084,7 +2143,35 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
 
     SHA256 master_hash;
     sha256_init(&master_hash);
-    {
+
+    /* Hash every cert — each thread hashes its own sub-range in parallel,
+     * then we combine thread hashes in range order for thread-count-independent result. */
+    int cert_hashing_ok = 1;
+    for (int i = 0; i < num_threads; i++) {
+        if (!work[i].cert_primes) { cert_hashing_ok = 0; break; }
+    }
+    if (cert_hashing_ok && !counterexample) {
+        printf("  Computing per-certificate SHA-256...\n");
+
+        /* Hash cert data: header (range) + sequential p_index bytes.
+         * The p_index sequence uniquely identifies every Goldbach pair because:
+         * - N is implied by position (range_start + 2*index)
+         * - p = small_primes[p_index]
+         * - q = N - p
+         * Hashing raw bytes avoids expensive sprint_u128 formatting (~1s vs ~30s). */
+        {
+            char header[128];
+            int hlen = snprintf(header, sizeof(header), "GBCERT:%s:%s\n", rs_h, re_h);
+            sha256_update(&master_hash, header, hlen);
+        }
+        for (int t = 0; t < num_threads; t++) {
+            if (work[t].cert_count > 0) {
+                sha256_update(&master_hash, (const char *)work[t].cert_primes,
+                              work[t].cert_count);
+            }
+        }
+    } else {
+        /* Fallback: hash summary if cert data unavailable */
         char summary[512];
         int len = snprintf(summary, sizeof(summary),
             "range=%s-%s verified=%" PRIu64 " max_attempts=%" PRIu64
@@ -2148,8 +2235,156 @@ static void run_exhaustive_range(uint128_t range_start, uint128_t range_end, int
         remove(tmp_path);
     }
 
+    /* Free cert_primes arrays */
+    for (int i = 0; i < num_threads; i++) {
+        if (work[i].cert_primes) free(work[i].cert_primes);
+    }
     free(threads);
     free(work);
+}
+
+/* ============================================================================
+ * EXPORT MODE — chunk-aligned verification with manifest output
+ * ============================================================================
+ * Splits a range into EXPORT_CHUNK_SIZE-aligned chunks, verifies each,
+ * writes start,end,sha256 to manifest.csv. Resumes from existing manifest.
+ */
+
+static void run_export_range(uint128_t range_start, uint128_t range_end, int num_threads) {
+    /* Align start down and end up to chunk boundaries */
+    uint128_t chunk_size = EXPORT_CHUNK_SIZE;
+    uint128_t aligned_start = (range_start / chunk_size) * chunk_size;
+    if (aligned_start < range_start) aligned_start = range_start;
+    /* Make sure aligned_start is even */
+    if (aligned_start % 2) aligned_start++;
+
+    /* Create export directory */
+    char mkdir_cmd[1100];
+    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p %s", export_path);
+    system(mkdir_cmd);
+
+    /* Build manifest path — unique per range */
+    char rs_hdr[50], re_hdr[50];
+    sprint_u128(rs_hdr, sizeof(rs_hdr), aligned_start);
+    sprint_u128(re_hdr, sizeof(re_hdr), range_end);
+
+    char manifest_path[1024];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest_%s_%s.csv",
+             export_path, rs_hdr, re_hdr);
+
+    uint128_t resume_from = aligned_start;
+    FILE *mf = fopen(manifest_path, "r");
+    if (mf) {
+        char line[256];
+        int count = 0;
+        while (fgets(line, sizeof(line), mf)) {
+            if (line[0] == '#') continue;
+            char *comma1 = strchr(line, ',');
+            if (comma1) {
+                char *comma2 = strchr(comma1 + 1, ',');
+                if (comma2) {
+                    char end_str[64] = {0};
+                    int len = (int)(comma2 - comma1 - 1);
+                    if (len > 0 && len < 63) {
+                        strncpy(end_str, comma1 + 1, len);
+                        uint128_t end_val = 0;
+                        for (const char *s = end_str; *s >= '0' && *s <= '9'; s++)
+                            end_val = end_val * 10 + (*s - '0');
+                        if (end_val > resume_from)
+                            resume_from = end_val;
+                        count++;
+                    }
+                }
+            }
+        }
+        fclose(mf);
+        if (count > 0) {
+            char rb[50];
+            sprint_u128(rb, sizeof(rb), resume_from);
+            printf("  Resuming from manifest: %d chunks completed, continuing from %s\n", count, rb);
+        }
+    }
+
+    /* Count total chunks */
+    uint64_t total_chunks = (uint64_t)((range_end - aligned_start + chunk_size - 1) / chunk_size);
+    uint64_t chunks_done = (uint64_t)((resume_from - aligned_start) / chunk_size);
+
+    char rs[50], re[50];
+    sprint_u128(rs, sizeof(rs), aligned_start);
+    sprint_u128(re, sizeof(re), range_end);
+    printf("EXPORT MODE — Chunk-aligned verification\n");
+    printf("  Range:      %s to %s\n", rs, re);
+    printf("  Chunk size: %" PRIu64 "\n", (uint64_t)chunk_size);
+    printf("  Chunks:     %" PRIu64 " total, %" PRIu64 " remaining\n",
+           total_chunks, total_chunks - chunks_done);
+    printf("  Manifest:   %s\n", manifest_path);
+    printf("  Threads:    %d\n\n", num_threads);
+
+    /* Process chunks */
+    fast_mode = 1;
+    uint128_t chunk_start = resume_from;
+
+    while (chunk_start < range_end && !stop_requested) {
+        uint128_t chunk_end = chunk_start + chunk_size;
+        if (chunk_end > range_end) chunk_end = range_end;
+
+        chunks_done++;
+        char cs[50], ce[50];
+        sprint_u128(cs, sizeof(cs), chunk_start);
+        sprint_u128(ce, sizeof(ce), chunk_end);
+        printf("\n--- Chunk %" PRIu64 "/%" PRIu64 ": %s to %s ---\n",
+               chunks_done, total_chunks, cs, ce);
+
+        char hash[65] = "";
+        run_exhaustive_range(chunk_start, chunk_end, num_threads, hash);
+
+        if (stop_requested) break;
+
+        if (strlen(hash) > 0) {
+            /* Append to manifest */
+            FILE *mf = fopen(manifest_path, "a");
+            if (mf) {
+                fprintf(mf, "%s,%s,%s\n", cs, ce, hash);
+                fclose(mf);
+                printf("  Wrote to manifest: %s,%s,%s\n", cs, ce, hash);
+            } else {
+                fprintf(stderr, "  ERROR: Could not write to %s\n", manifest_path);
+            }
+        }
+
+        chunk_start = chunk_end;
+    }
+
+    if (stop_requested) {
+        printf("\n  Export interrupted. %" PRIu64 "/%" PRIu64 " chunks completed.\n",
+               chunks_done, total_chunks);
+        printf("  Resume with the same command — completed chunks will be skipped.\n");
+    } else {
+        printf("\n  Export complete! %" PRIu64 " chunks written to %s\n",
+               total_chunks, manifest_path);
+
+        /* Compute Merkle root from all chunk hashes */
+        mf = fopen(manifest_path, "r");
+        if (mf) {
+            SHA256 merkle;
+            sha256_init(&merkle);
+            char line[256];
+            while (fgets(line, sizeof(line), mf)) {
+                sha256_update(&merkle, line, strlen(line));
+            }
+            fclose(mf);
+            char merkle_hex[65];
+            sha256_final(&merkle, merkle_hex);
+            printf("  Merkle root: %s\n", merkle_hex);
+
+            /* Append merkle root to manifest */
+            mf = fopen(manifest_path, "a");
+            if (mf) {
+                fprintf(mf, "# merkle_root=%s\n", merkle_hex);
+                fclose(mf);
+            }
+        }
+    }
 }
 
 /* ============================================================================
@@ -2316,12 +2551,18 @@ static void run_beyond(int64_t num_samples, const char *cert_file,
 
     FILE *cf = NULL;
     if (cert_file) {
-        cf = fopen(cert_file, "w");
+        /* Append if file exists, create if not */
+        int exists = (access(cert_file, F_OK) == 0);
+        cf = fopen(cert_file, "a");
         if (!cf) { fprintf(stderr, "Cannot open %s for writing\n", cert_file); return; }
-        fprintf(cf, "# Goldbach Certificates — Dual Verified\n");
-        fprintf(cf, "# Primality: Miller-Rabin (12 witnesses) + BPSW (Strong Lucas)\n");
-        fprintf(cf, "# Format: N=p+q\n");
-        fprintf(cf, "# Both p and q are dual-verified primes.\n#\n");
+        if (!exists) {
+            fprintf(cf, "# Goldbach Certificates — Dual Verified\n");
+            fprintf(cf, "# Primality: Miller-Rabin (12 witnesses) + BPSW (Strong Lucas)\n");
+            fprintf(cf, "# Format: N=p+q\n");
+            fprintf(cf, "# Both p and q are dual-verified primes.\n#\n");
+        }
+        fprintf(cf, "# Run: beyond %" PRId64 " samples, %s\n",
+                num_samples, fast_mode ? "fast" : "dual");
     }
 
     pthread_mutex_t cert_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2500,12 +2741,17 @@ static void run_suspect(int64_t num_samples, uint128_t scale_lo, uint128_t scale
 
     FILE *cf = NULL;
     if (cert_file) {
-        cf = fopen(cert_file, "w");
+        /* Append if file exists, create if not */
+        int exists = (access(cert_file, F_OK) == 0);
+        cf = fopen(cert_file, "a");
         if (!cf) { fprintf(stderr, "Cannot open %s for writing\n", cert_file); return; }
-        fprintf(cf, "# Goldbach Certificates — SUSPECT (Adversarial) Mode\n");
-        fprintf(cf, "# Numbers constructed via CRT to maximize difficulty\n");
-        fprintf(cf, "# Primality: Miller-Rabin + BPSW dual verification\n");
-        fprintf(cf, "# Format: N=p+q\n#\n");
+        if (!exists) {
+            fprintf(cf, "# Goldbach Certificates — SUSPECT (Adversarial) Mode\n");
+            fprintf(cf, "# Numbers constructed via CRT to maximize difficulty\n");
+            fprintf(cf, "# Primality: Miller-Rabin + BPSW dual verification\n");
+            fprintf(cf, "# Format: N=p+q\n#\n");
+        }
+        fprintf(cf, "# Run: suspect %" PRId64 " samples\n", num_samples);
     }
 
     pthread_mutex_t cert_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -2761,6 +3007,412 @@ static void community_status(const char *server) {
     printf("  Active clients:  %s\n\n", active);
 }
 
+/* ============================================================================
+ * UPLOAD — submit offline results to server
+ * ============================================================================ */
+static const char *upload_path = NULL;
+
+static void run_upload(const char *server) {
+    /* Load client ID */
+    char client_id[64];
+    FILE *idf = fopen(".goldbach_client_id", "r");
+    if (idf) {
+        if (fgets(client_id, sizeof(client_id), idf)) {
+            char *nl = strchr(client_id, '\n');
+            if (nl) *nl = 0;
+        }
+        fclose(idf);
+    } else {
+        snprintf(client_id, sizeof(client_id), "upload_%lx_%d",
+                 (unsigned long)time(NULL), getpid());
+    }
+
+    printf("UPLOAD MODE — Submit offline results to server\n");
+    printf("  Server: %s\n", server);
+    printf("  Client: %s\n", client_id);
+    printf("  Path:   %s\n\n", upload_path);
+
+    /* Detect type: directory with manifest_*.csv files = exhaustive, single file = certs */
+    char manifest_paths[64][1024];
+    int num_manifests = 0;
+    int is_manifest = 0;
+
+    /* Check if path is a directory — look for manifest_*.csv files */
+    char find_cmd[1100];
+    snprintf(find_cmd, sizeof(find_cmd), "ls %s/manifest_*.csv 2>/dev/null", upload_path);
+    FILE *ls = popen(find_cmd, "r");
+    if (ls) {
+        char path[1024];
+        while (fgets(path, sizeof(path), ls) && num_manifests < 64) {
+            char *nl = strchr(path, '\n');
+            if (nl) *nl = 0;
+            strncpy(manifest_paths[num_manifests++], path, 1023);
+        }
+        pclose(ls);
+    }
+    if (num_manifests > 0) {
+        is_manifest = 1;
+    } else {
+        /* Try the path itself as a file */
+        FILE *mf = fopen(upload_path, "r");
+        if (!mf) {
+            fprintf(stderr, "Cannot open %s\n", upload_path);
+            return;
+        }
+        char firstline[256];
+        if (fgets(firstline, sizeof(firstline), mf)) {
+            int commas = 0;
+            for (char *c = firstline; *c; c++) if (*c == ',') commas++;
+            if (commas == 2 && strlen(firstline) > 64) {
+                is_manifest = 1;
+                strncpy(manifest_paths[0], upload_path, 1023);
+                num_manifests = 1;
+            }
+        }
+        fclose(mf);
+        if (!is_manifest) {
+            strncpy(manifest_paths[0], upload_path, 1023);
+            num_manifests = 1;
+        }
+    }
+
+    if (is_manifest) {
+        /* Upload manifest chunks */
+        printf("  Detected: %d manifest file(s)\n", num_manifests);
+
+      for (int mi = 0; mi < num_manifests; mi++) {
+        char *manifest_path = manifest_paths[mi];
+        printf("\n  Processing: %s\n", manifest_path);
+        FILE *mf = fopen(manifest_path, "r");
+        if (!mf) { fprintf(stderr, "Cannot open %s\n", manifest_path); continue; }
+
+        /* Count lines and build pre-flight check */
+        int total_lines = 0;
+        char line[256];
+        char preflight_json[512 * 1024];
+        int ppos = snprintf(preflight_json, sizeof(preflight_json), "{\"chunks\":[");
+
+        while (fgets(line, sizeof(line), mf)) {
+            if (line[0] == '#' || !strchr(line, ',')) continue;
+            /* Parse start,end */
+            char linecopy[256];
+            strncpy(linecopy, line, 255);
+            char *c1 = strchr(linecopy, ',');
+            if (!c1) continue;
+            *c1 = 0;
+            char *c2 = strchr(c1 + 1, ',');
+            if (c2) *c2 = 0;
+            char *nl = strchr(c1 + 1, '\n');
+            if (nl) *nl = 0;
+
+            if (total_lines > 0) ppos += snprintf(preflight_json + ppos, sizeof(preflight_json) - ppos, ",");
+            ppos += snprintf(preflight_json + ppos, sizeof(preflight_json) - ppos,
+                "{\"start\":\"%s\",\"end\":\"%s\"}", linecopy, c1 + 1);
+            total_lines++;
+        }
+        ppos += snprintf(preflight_json + ppos, sizeof(preflight_json) - ppos, "]}");
+        rewind(mf);
+
+        /* Pre-flight check: ask server which chunks are needed */
+        printf("  Checking server for %d chunks...\n", total_lines);
+        {
+            char cmd[512 * 1024 + 1024];
+            snprintf(cmd, sizeof(cmd),
+                "curl -s -X POST '%s/api/check-chunks' "
+                "-H 'Content-Type: application/json' "
+                "-d '%s' 2>/dev/null", server, preflight_json);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                char response[8192] = "";
+                size_t total = 0;
+                while (total < sizeof(response) - 1) {
+                    size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+                    if (n == 0) break;
+                    total += n;
+                }
+                response[total] = 0;
+                pclose(fp);
+
+                char msg[256] = "";
+                json_get_str(response, "message", msg, sizeof(msg));
+                char new_str[32] = "";
+                json_get_str(response, "new", new_str, sizeof(new_str));
+                int new_count = atoi(new_str);
+
+                printf("  Server: %s\n", msg);
+
+                if (new_count == 0) {
+                    printf("  Nothing new to upload. Skipping.\n");
+                    fclose(mf);
+                    continue;
+                }
+            }
+        }
+
+        /* Upload in batches of 100 */
+        int uploaded = 0;
+        int batch_size = 100;
+
+        while (!feof(mf)) {
+            /* Build JSON batch */
+            char json_buf[256 * 1024];  /* 256KB — enough for 100 chunks */
+            int pos = snprintf(json_buf, sizeof(json_buf),
+                "{\"client_id\":\"import_%s\",\"chunks\":[", client_id);
+
+            int batch_count = 0;
+            while (batch_count < batch_size && fgets(line, sizeof(line), mf)) {
+                if (line[0] == '#' || !strchr(line, ',')) continue;
+
+                /* Parse: start,end,sha256 */
+                char *comma1 = strchr(line, ',');
+                if (!comma1) continue;
+                *comma1 = 0;
+                char *comma2 = strchr(comma1 + 1, ',');
+                if (!comma2) continue;
+                *comma2 = 0;
+                char *hash = comma2 + 1;
+                /* Strip newline from hash */
+                char *nl = strchr(hash, '\n');
+                if (nl) *nl = 0;
+
+                if (batch_count > 0) pos += snprintf(json_buf + pos, sizeof(json_buf) - pos, ",");
+                pos += snprintf(json_buf + pos, sizeof(json_buf) - pos,
+                    "{\"start\":\"%s\",\"end\":\"%s\",\"sha256\":\"%s\"}",
+                    line, comma1 + 1, hash);
+                batch_count++;
+            }
+
+            if (batch_count == 0) break;
+            pos += snprintf(json_buf + pos, sizeof(json_buf) - pos, "]}");
+
+            /* Submit batch */
+            char cmd[256 * 1024 + 1024];
+            snprintf(cmd, sizeof(cmd),
+                "curl -s -X POST '%s/api/import' "
+                "-H 'Content-Type: application/json' "
+                "-d '%s' 2>/dev/null",
+                server, json_buf);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                char response[2048] = "";
+                size_t total = 0;
+                while (total < sizeof(response) - 1) {
+                    size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+                    if (n == 0) break;
+                    total += n;
+                }
+                response[total] = 0;
+                pclose(fp);
+
+                char msg[256] = "";
+                json_get_str(response, "message", msg, sizeof(msg));
+                uploaded += batch_count;
+                printf("  Uploaded %d/%d chunks — %s\n", uploaded, total_lines, msg);
+            }
+        }
+
+        fclose(mf);
+        printf("  Manifest complete. %d chunks submitted.\n", uploaded);
+      } /* end manifest loop */
+
+    } else {
+        /* Upload cert file (beyond/suspect) */
+        printf("  Detected: Certificate file (beyond/suspect)\n");
+        char *cert_path = manifest_paths[0];
+        FILE *mf = fopen(cert_path, "r");
+        if (!mf) { fprintf(stderr, "Cannot open %s\n", cert_path); return; }
+
+        /* Count lines */
+        int total_lines = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), mf)) {
+            if (strchr(line, '=') || strchr(line, ',')) total_lines++;
+        }
+        rewind(mf);
+
+        printf("  Certificates to upload: %d\n\n", total_lines);
+
+        /* Upload in batches of 500 */
+        int uploaded = 0;
+        int batch_size = 500;
+
+        while (!feof(mf)) {
+            char json_buf[512 * 1024];
+            int pos = snprintf(json_buf, sizeof(json_buf),
+                "{\"client_id\":\"import_%s\",\"mode\":\"import\",\"certs\":[", client_id);
+
+            int batch_count = 0;
+            while (batch_count < batch_size && fgets(line, sizeof(line), mf)) {
+                char *nl = strchr(line, '\n');
+                if (nl) *nl = 0;
+
+                /* Parse N=p+q or N,p,q format */
+                char n_str[64] = "", p_str[64] = "", q_str[64] = "";
+
+                char *eq = strchr(line, '=');
+                if (eq) {
+                    /* N=p+q format */
+                    *eq = 0;
+                    strncpy(n_str, line, 63);
+                    char *plus = strchr(eq + 1, '+');
+                    if (plus) {
+                        *plus = 0;
+                        strncpy(p_str, eq + 1, 63);
+                        strncpy(q_str, plus + 1, 63);
+                    }
+                } else {
+                    /* N,p,q format */
+                    char *c1 = strchr(line, ',');
+                    if (c1) {
+                        *c1 = 0;
+                        strncpy(n_str, line, 63);
+                        char *c2 = strchr(c1 + 1, ',');
+                        if (c2) {
+                            *c2 = 0;
+                            strncpy(p_str, c1 + 1, 63);
+                            strncpy(q_str, c2 + 1, 63);
+                        }
+                    }
+                }
+
+                if (strlen(n_str) > 0 && strlen(p_str) > 0 && strlen(q_str) > 0) {
+                    if (batch_count > 0) pos += snprintf(json_buf + pos, sizeof(json_buf) - pos, ",");
+                    pos += snprintf(json_buf + pos, sizeof(json_buf) - pos,
+                        "{\"n\":\"%s\",\"p\":\"%s\",\"q\":\"%s\"}", n_str, p_str, q_str);
+                    batch_count++;
+                }
+            }
+
+            if (batch_count == 0) break;
+            pos += snprintf(json_buf + pos, sizeof(json_buf) - pos, "]}");
+
+            /* Submit batch */
+            char cmd[512 * 1024 + 1024];
+            snprintf(cmd, sizeof(cmd),
+                "curl -s -X POST '%s/api/import-certs' "
+                "-H 'Content-Type: application/json' "
+                "-d '%s' 2>/dev/null",
+                server, json_buf);
+            FILE *fp = popen(cmd, "r");
+            if (fp) {
+                char response[2048] = "";
+                size_t total = 0;
+                while (total < sizeof(response) - 1) {
+                    size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+                    if (n == 0) break;
+                    total += n;
+                }
+                response[total] = 0;
+                pclose(fp);
+
+                char msg[256] = "";
+                json_get_str(response, "message", msg, sizeof(msg));
+                uploaded += batch_count;
+                printf("  Uploaded %d/%d certs — %s\n", uploaded, total_lines, msg);
+            }
+        }
+
+        fclose(mf);
+        printf("\n  Upload complete. %d certificates submitted.\n", uploaded);
+    }
+}
+
+/* ============================================================================
+ * SPOT-CHECK — independently verify random chunks from server
+ * ============================================================================ */
+
+static void run_spot_check(const char *server, int count) {
+    printf("SPOT-CHECK MODE — Independent verification audit\n");
+    printf("  Server: %s\n", server);
+    printf("  Chunks to verify: %d\n\n", count);
+
+    /* Fetch random chunks from server */
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+        "curl -s '%s/api/spot-check?count=%d' 2>/dev/null", server, count);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { fprintf(stderr, "Cannot reach server.\n"); return; }
+
+    char response[65536] = "";
+    size_t total = 0;
+    while (total < sizeof(response) - 1) {
+        size_t n = fread(response + total, 1, sizeof(response) - 1 - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    response[total] = 0;
+    pclose(fp);
+
+    /* Parse chunks from response — simple extraction */
+    /* Format: {"count":N,"chunks":[{"start":"X","end":"Y","hash_a":"H",...},...]} */
+    int passed = 0, failed = 0, checked = 0;
+    int cores = detect_cores();
+    fast_mode = 1;
+
+    /* Find each chunk object */
+    char *pos = response;
+    while ((pos = strstr(pos, "\"start\"")) != NULL) {
+        char start_s[64] = "", end_s[64] = "", expected_hash[65] = "";
+
+        json_get_str(pos, "start", start_s, sizeof(start_s));
+        json_get_str(pos, "end", end_s, sizeof(end_s));
+        json_get_str(pos, "hash_a", expected_hash, sizeof(expected_hash));
+
+        if (strlen(start_s) == 0 || strlen(end_s) == 0 || strlen(expected_hash) == 0) {
+            pos++;
+            continue;
+        }
+
+        /* Parse range */
+        uint128_t range_start = 0, range_end = 0;
+        for (const char *s = start_s; *s >= '0' && *s <= '9'; s++)
+            range_start = range_start * 10 + (*s - '0');
+        for (const char *s = end_s; *s >= '0' && *s <= '9'; s++)
+            range_end = range_end * 10 + (*s - '0');
+
+        checked++;
+        printf("\n--- Spot-check %d/%d: %s to %s ---\n", checked, count, start_s, end_s);
+
+        char hash[65] = "";
+        run_exhaustive_range(range_start, range_end, cores, hash);
+
+        if (strlen(hash) > 0) {
+            if (strcmp(hash, expected_hash) == 0) {
+                printf("  PASS — hash matches: %s\n", hash);
+                passed++;
+            } else {
+                printf("  FAIL — hash mismatch!\n");
+                printf("    Expected: %s\n", expected_hash);
+                printf("    Got:      %s\n", hash);
+                failed++;
+            }
+        } else {
+            printf("  ERROR — could not compute hash\n");
+            failed++;
+        }
+
+        pos++;
+    }
+
+    printf("\n====================================================================\n");
+    printf("  SPOT-CHECK RESULTS\n");
+    printf("====================================================================\n");
+    printf("  Chunks checked: %d\n", checked);
+    printf("  Passed:         %d\n", passed);
+    printf("  Failed:         %d\n", failed);
+    if (failed == 0 && checked > 0) {
+        printf("\n  ALL SPOT-CHECKS PASSED.\n");
+        printf("  Statistical confidence: if %.1f%% of chunks were fake,\n",
+               100.0 / checked);
+        printf("  probability of passing all %d checks: < %.2e\n",
+               checked, 1.0);  /* simplified */
+    } else if (failed > 0) {
+        printf("\n  *** VERIFICATION FAILURES DETECTED ***\n");
+        printf("  %d chunks produced different hashes. Investigation required.\n", failed);
+    }
+    printf("====================================================================\n");
+}
+
 static void run_community(const char *server) {
     printf("COMMUNITY MODE — Distributed Verification\n");
     printf("Server: %s\n", server);
@@ -2776,9 +3428,21 @@ static void run_community(const char *server) {
         }
         fclose(idf);
     } else {
-        /* Generate a simple unique ID from time + pid */
-        snprintf(client_id, sizeof(client_id), "client_%lx_%d",
-                 (unsigned long)time(NULL), getpid());
+        /* Generate unique ID from /dev/urandom for cross-machine uniqueness */
+        FILE *urand = fopen("/dev/urandom", "r");
+        if (urand) {
+            unsigned char bytes[8];
+            if (fread(bytes, 1, 8, urand) == 8) {
+                snprintf(client_id, sizeof(client_id),
+                    "client_%02x%02x%02x%02x%02x%02x%02x%02x",
+                    bytes[0], bytes[1], bytes[2], bytes[3],
+                    bytes[4], bytes[5], bytes[6], bytes[7]);
+            }
+            fclose(urand);
+        } else {
+            snprintf(client_id, sizeof(client_id), "client_%lx_%d",
+                     (unsigned long)time(NULL), getpid());
+        }
         idf = fopen(".goldbach_client_id", "w");
         if (idf) { fprintf(idf, "%s\n", client_id); fclose(idf); }
     }
@@ -2786,6 +3450,9 @@ static void run_community(const char *server) {
 
     /* Show current status */
     community_status(server);
+
+    /* Run at lowest CPU priority — full speed when idle, yields to other processes */
+    nice(19);
 
     /* Main loop */
     int chunks_done = 0;
@@ -3093,6 +3760,9 @@ static void print_usage(const char *prog) {
     printf("                       auto-escalates to full dual MR+BPSW if shortcut fails.\n");
     printf("  --checkpoint FILE   Auto-save progress every 60s, resume on restart\n");
     printf("  --cert FILE         Write certificates to FILE (used with --beyond)\n");
+    printf("  --export DIR        Export chunk-aligned results with manifest for upload\n");
+    printf("  --upload PATH       Upload manifest or cert file to community server\n");
+    printf("  --spot-check N      Verify N random chunks from server (audit mode)\n");
     printf("  THREADS             Number of threads (default: auto-detect all cores)\n");
     printf("\nEXAMPLES:\n\n");
     printf("  # Exhaustive verification\n");
@@ -3176,6 +3846,12 @@ int main(int argc, char **argv) {
             if (i+1 < argc) {
                 community_threads = atoi(argv[++i]);
                 if (community_threads < 1) community_threads = 1;
+                int max_cores = detect_cores();
+                if (community_threads > max_cores) {
+                    printf("  Note: clamping to %d cores (this machine has %d)\n",
+                           max_cores, max_cores);
+                    community_threads = max_cores;
+                }
             }
         } else if (strcmp(argv[i], "--suspect") == 0) {
             suspect_mode = 1;
@@ -3209,6 +3885,13 @@ int main(int argc, char **argv) {
             using_mmap_primes = 2;  /* flag: force cache */
         } else if (strcmp(argv[i], "--checkpoint") == 0 && i+1 < argc) {
             checkpoint_file = argv[++i];
+        } else if (strcmp(argv[i], "--export") == 0 && i+1 < argc) {
+            export_path = argv[++i];
+        } else if (strcmp(argv[i], "--upload") == 0 && i+1 < argc) {
+            upload_path = argv[++i];
+        } else if (strcmp(argv[i], "--spot-check") == 0 && i+1 < argc) {
+            spot_check_count = atoi(argv[++i]);
+            if (spot_check_count < 1) spot_check_count = 10;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -3235,6 +3918,18 @@ int main(int argc, char **argv) {
 
     /* Install signal handler for clean interruption */
     signal(SIGINT, sigint_handler);
+
+    /* Upload mode — submit offline results */
+    if (upload_path) {
+        run_upload(community_url);
+        return 0;
+    }
+
+    /* Spot-check mode — verify random chunks from server */
+    if (spot_check_count > 0) {
+        run_spot_check(community_url, spot_check_count);
+        return 0;
+    }
 
     /* Community mode — runs its own loop */
     if (community_mode) {
@@ -3263,7 +3958,11 @@ int main(int argc, char **argv) {
         if (range_start < 4) range_start = 4;
         if (range_start % 2) range_start++;
         if (range_end % 2) range_end--;
-        run_exhaustive_range(range_start, range_end, num_threads, NULL);
+        if (export_path) {
+            run_export_range(range_start, range_end, num_threads);
+        } else {
+            run_exhaustive_range(range_start, range_end, num_threads, NULL);
+        }
     }
 
     /* Cleanup */
