@@ -1,4 +1,6 @@
 goldbach
+a.out
+__pycache__/
 goldbach_primes.bin
 goldbach_checkpoint.txt
 goldbach_checkpoint.txt.tmp
